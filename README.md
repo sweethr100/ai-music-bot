@@ -1,6 +1,6 @@
 # AI Music Discord Bot
 
-음악 재생과 AI 음악 처리를 `/play` 하나로 쓰는 Discord 음악 봇입니다. 기존 all-in-one 봇 코드를 복사하지 않고, 음악 기능만 새 구조로 다시 만들었습니다.
+음악 재생과 AI 음악 처리를 `/play` 하나로 쓰는 Discord 음악 봇입니다.
 
 ## 지원 기능
 
@@ -32,7 +32,7 @@
 Windows PowerShell:
 
 ```powershell
-cd C:\Users\sweet\Desktop\discord-ai-musicbot\ai-music-bot
+cd path\to\ai-music-bot
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 .\scripts\install_ai.ps1
