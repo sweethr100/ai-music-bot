@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+data/processed/
+tmp/
+vendor/Applio/
+vendor/ApplioV*/
+voice_models/*/*.pth
+voice_models/*/*.index
+voice_models/*/*.onnx
