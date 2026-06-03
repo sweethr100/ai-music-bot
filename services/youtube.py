@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -12,6 +13,20 @@ YDL_COMMON = {
     "no_warnings": True,
     "skip_download": True,
 }
+
+
+def build_youtube_query(query: str) -> str:
+    value = query.strip()
+    if not value:
+        raise ValueError("유튜브 URL 또는 검색어를 입력해 주세요.")
+
+    lower_value = value.lower()
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value) or lower_value.startswith(
+        ("www.", "youtube.com", "youtu.be", "m.youtube.com", "music.youtube.com")
+    ):
+        return value
+
+    return f"ytsearch1:{value}"
 
 
 @dataclass
@@ -45,12 +60,14 @@ class YouTubeService:
                 **YDL_COMMON,
                 "format": "bestaudio/best",
                 "noplaylist": True,
-                "default_search": "ytsearch",
+                "default_search": "ytsearch1",
             }
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(query, download=False)
+                info = ydl.extract_info(build_youtube_query(query), download=False)
                 if "entries" in info:
-                    info = next(entry for entry in info["entries"] if entry)
+                    info = next((entry for entry in info["entries"] if entry), None)
+                    if not info:
+                        raise ValueError("검색 결과를 찾지 못했습니다.")
                 return self._track_from_info(info)
 
         loop = asyncio.get_running_loop()
@@ -102,9 +119,13 @@ class YouTubeService:
 
     @staticmethod
     def _track_from_info(info: dict) -> TrackInfo:
+        webpage_url = info.get("webpage_url") or info.get("original_url") or ""
+        if info.get("id") and "youtube" not in webpage_url and "youtu.be" not in webpage_url:
+            webpage_url = f"https://www.youtube.com/watch?v={info['id']}"
+
         return TrackInfo(
             title=info.get("title") or "알 수 없는 제목",
-            webpage_url=info.get("webpage_url") or info.get("original_url") or "",
+            webpage_url=webpage_url,
             duration=info.get("duration") or 0,
             thumbnail=info.get("thumbnail") or "",
             stream_url=info.get("url"),

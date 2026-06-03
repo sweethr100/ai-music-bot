@@ -13,11 +13,52 @@ function Install-CudaTorch {
     param([string]$PythonExe)
     & $PythonExe -m pip install -U pip
     & $PythonExe -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url $TorchIndex
+    Install-AudioSaveDependencies -PythonExe $PythonExe
+}
+
+function Install-AudioSaveDependencies {
+    param([string]$PythonExe)
+
+    $TorchCodecRequirement = & $PythonExe -c @'
+import sys
+import torch
+
+version = torch.__version__.split("+", 1)[0].split(".")
+major, minor = int(version[0]), int(version[1])
+if sys.version_info >= (3, 13) and (major, minor) < (2, 8):
+    raise SystemExit(
+        f"Python 3.13에서 TorchCodec을 쓰려면 torch 2.8 이상이 필요합니다. "
+        f"현재 torch는 {torch.__version__}입니다. `-TorchCuda cu128`로 다시 설치하거나 Python 3.12 venv를 사용해 주세요."
+    )
+if (major, minor) >= (2, 11):
+    print("torchcodec")
+elif (major, minor) == (2, 10):
+    print("torchcodec==0.10.*")
+elif (major, minor) == (2, 9):
+    print("torchcodec==0.9.*")
+elif (major, minor) == (2, 8):
+    print("torchcodec==0.7.*")
+elif (major, minor) == (2, 7):
+    print("torchcodec==0.5.*")
+    else:
+        print("torchcodec==0.2.*")
+'@
+    if ($LASTEXITCODE -ne 0) {
+        throw "TorchCodec 호환 버전을 고르지 못했습니다."
+    }
+
+    & $PythonExe -m pip install "soundfile>=0.12.1"
+    & $PythonExe -m pip install $TorchCodecRequirement
 }
 
 function Test-CudaTorch {
     param([string]$PythonExe, [string]$Label)
     & $PythonExe -c "import torch; assert torch.cuda.is_available(), 'CUDA is not available'; print('$Label CUDA OK:', torch.__version__, torch.cuda.get_device_name(0))"
+}
+
+function Test-AudioSave {
+    param([string]$PythonExe, [string]$Label)
+    & $PythonExe -c "import tempfile, torch, torchaudio; path = tempfile.mktemp(suffix='.wav'); torchaudio.save(path, torch.zeros(1, 16000), 16000); print('$Label audio save OK:', path)"
 }
 
 if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
@@ -37,6 +78,7 @@ Write-Host "Installing bot + AI music dependencies..."
 python -m pip install -r (Join-Path $Root "requirements.txt")
 Install-CudaTorch -PythonExe "python"
 Test-CudaTorch -PythonExe "python" -Label "Bot"
+Test-AudioSave -PythonExe "python" -Label "Bot"
 
 if (-not (Test-Path $VendorDir)) {
     New-Item -ItemType Directory -Path $VendorDir | Out-Null
@@ -68,10 +110,16 @@ if (Test-Path $ApplioRequirements) {
 }
 
 Test-CudaTorch -PythonExe $ApplioPython -Label "Applio"
+Test-AudioSave -PythonExe $ApplioPython -Label "Applio"
 
 $VoiceModels = Join-Path $Root "voice_models"
 if (-not (Test-Path $VoiceModels)) {
     New-Item -ItemType Directory -Path $VoiceModels | Out-Null
+}
+
+$Recordings = Join-Path $Root "data\recordings"
+if (-not (Test-Path $Recordings)) {
+    New-Item -ItemType Directory -Path $Recordings | Out-Null
 }
 
 Write-Host ""

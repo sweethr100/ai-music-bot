@@ -1,7 +1,12 @@
 .env
+.venv/
+venv/
+env/
+*.venv/
 __pycache__/
 *.pyc
 data/processed/
+data/recordings/
 tmp/
 vendor/Applio/
 vendor/ApplioV*/

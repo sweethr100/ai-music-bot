@@ -24,6 +24,8 @@ class AIMusicBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.load_extension("cogs.music")
+        await self.load_extension("cogs.voice_recording")
+        await self.load_extension("cogs.voice_training")
 
         if self.settings.guild_id:
             guild = discord.Object(id=self.settings.guild_id)
