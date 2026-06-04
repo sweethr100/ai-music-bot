@@ -131,6 +131,126 @@ class MusicCog(commands.Cog):
             self.states[guild_id] = GuildMusicState()
         return self.states[guild_id]
 
+    @staticmethod
+    def _simple_embed(
+        title: str,
+        description: str | None = None,
+        color: discord.Color | None = None,
+    ) -> discord.Embed:
+        return discord.Embed(
+            title=title,
+            description=description,
+            color=color or discord.Color.blurple(),
+        )
+
+    def _song_embed(
+        self,
+        title: str,
+        song: Song,
+        description: str | None = None,
+        color: discord.Color | None = None,
+    ) -> discord.Embed:
+        embed = self._simple_embed(title, description, color or discord.Color.green())
+        embed.add_field(name="곡", value=f"[{song.title}]({song.url})", inline=False)
+        embed.add_field(name="재생 시간", value=song.duration_text(), inline=True)
+        embed.add_field(name="요청자", value=song.requester_name, inline=True)
+        detail = song.detail_text()
+        if detail:
+            embed.add_field(name="옵션", value=detail, inline=False)
+        if song.track.thumbnail:
+            embed.set_thumbnail(url=song.track.thumbnail)
+        return embed
+
+    async def _send_followup_embed(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        description: str | None = None,
+        *,
+        color: discord.Color | None = None,
+        ephemeral: bool = False,
+    ):
+        return await interaction.followup.send(
+            embed=self._simple_embed(title, description, color),
+            ephemeral=ephemeral,
+        )
+
+    async def _send_response_embed(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        description: str | None = None,
+        *,
+        color: discord.Color | None = None,
+        ephemeral: bool = False,
+    ) -> None:
+        embed = self._simple_embed(title, description, color)
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+    @staticmethod
+    async def _edit_message_embed(
+        message,
+        title: str,
+        description: str | None = None,
+        *,
+        color: discord.Color | None = None,
+    ) -> None:
+        await message.edit(
+            content=None,
+            embed=discord.Embed(
+                title=title,
+                description=description,
+                color=color or discord.Color.blurple(),
+            ),
+        )
+
+    async def _edit_processing_status(self, message, mode_label: str, text: str) -> None:
+        await self._edit_message_embed(
+            message,
+            f"{mode_label} 처리 중",
+            text,
+            color=discord.Color.blurple(),
+        )
+
+    async def _edit_play_result_status(
+        self,
+        message,
+        song: Song,
+        *,
+        play_in_voice: bool,
+        upload_file: bool,
+        uploaded: bool,
+    ) -> None:
+        if play_in_voice and upload_file:
+            if uploaded:
+                title = "대기열에 추가됨"
+                description = "파일도 채팅에 올렸습니다."
+                color = discord.Color.green()
+            else:
+                title = "대기열에 추가됨"
+                description = "파일 업로드는 실패했지만 통화방 재생 대기열에는 추가했습니다."
+                color = discord.Color.orange()
+        elif play_in_voice:
+            title = "대기열에 추가됨"
+            description = "통화방 재생 대기열에 추가했습니다."
+            color = discord.Color.green()
+        elif uploaded:
+            title = "파일 업로드 완료"
+            description = "처리한 파일을 채팅에 올렸습니다."
+            color = discord.Color.green()
+        else:
+            title = "파일 업로드 실패"
+            description = "파일 업로드에 실패했습니다."
+            color = discord.Color.red()
+
+        await message.edit(
+            content=None,
+            embed=self._song_embed(title, song, description, color),
+        )
+
     async def _ensure_voice(
         self,
         interaction: discord.Interaction,
@@ -139,8 +259,11 @@ class MusicCog(commands.Cog):
         user_voice = getattr(interaction.user, "voice", None)
         channel = target_channel or getattr(user_voice, "channel", None)
         if not channel:
-            await interaction.followup.send(
+            await self._send_followup_embed(
+                interaction,
+                "음성 채널이 필요합니다",
                 "먼저 음성 채널에 들어가거나 `voice_channel`을 선택해 주세요.",
+                color=discord.Color.orange(),
                 ephemeral=True,
             )
             return None
@@ -150,9 +273,12 @@ class MusicCog(commands.Cog):
             await interaction.guild.change_voice_state(channel=voice_client.channel, self_deaf=False)
             if voice_client.channel != channel:
                 if self._voice_client_busy(interaction.guild_id, voice_client):
-                    await interaction.followup.send(
+                    await self._send_followup_embed(
+                        interaction,
+                        "현재 채널에 추가합니다",
                         f"이미 **{voice_client.channel.name}**에서 재생 중이라 "
                         "새 요청은 현재 재생 채널의 대기열에 넣습니다.",
+                        color=discord.Color.orange(),
                         ephemeral=True,
                     )
                     return voice_client
@@ -179,18 +305,36 @@ class MusicCog(commands.Cog):
             return None
 
         if not interaction.guild:
-            await interaction.followup.send("서버 안에서만 음성 채널을 선택할 수 있습니다.", ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "서버 전용 기능입니다",
+                "서버 안에서만 음성 채널을 선택할 수 있습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return None
 
         try:
             channel_id = int(connected_voice_channel)
         except ValueError:
-            await interaction.followup.send("선택한 음성 채널 값을 읽지 못했습니다.", ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "음성 채널 선택 오류",
+                "선택한 음성 채널 값을 읽지 못했습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return None
 
         channel = interaction.guild.get_channel(channel_id)
         if not isinstance(channel, discord.VoiceChannel):
-            await interaction.followup.send("선택한 음성 채널을 찾지 못했습니다.", ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "음성 채널 선택 오류",
+                "선택한 음성 채널을 찾지 못했습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return None
 
         return channel
@@ -434,11 +578,16 @@ class MusicCog(commands.Cog):
                 await self._send_enqueue_message(interaction, song)
                 return
 
-            status = await interaction.followup.send(f"{self._mode_label(effective_mode)} 모드 준비 중...")
+            mode_label = self._mode_label(effective_mode)
+            status = await self._send_followup_embed(
+                interaction,
+                f"{mode_label} 준비 중",
+                "요청을 처리할 준비를 하고 있습니다.",
+            )
 
             async def progress(text: str) -> None:
                 try:
-                    await status.edit(content=text)
+                    await self._edit_processing_status(status, mode_label, text)
                 except discord.HTTPException:
                     pass
 
@@ -475,26 +624,31 @@ class MusicCog(commands.Cog):
             if play_in_voice:
                 await self._enqueue(interaction, song)
 
-            if play_in_voice and upload_file:
-                if uploaded:
-                    await status.edit(content=f"대기열에 추가하고 파일도 올렸습니다: **{song.title}**")
-                else:
-                    await status.edit(content=f"대기열에는 추가했지만 파일 업로드는 실패했습니다: **{song.title}**")
-            elif play_in_voice:
-                await status.edit(content=f"대기열에 추가했습니다: **{song.title}**")
-            else:
-                await status.edit(
-                    content=(
-                        f"파일을 올렸습니다: **{song.title}**"
-                        if uploaded
-                        else f"파일 업로드에 실패했습니다: **{song.title}**"
-                    )
-                )
+            await self._edit_play_result_status(
+                status,
+                song,
+                play_in_voice=play_in_voice,
+                upload_file=upload_file,
+                uploaded=uploaded,
+            )
+            if not play_in_voice:
                 self._cleanup_song(song)
         except OptionalFeatureMissing as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "기능을 사용할 수 없습니다",
+                str(exc),
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
         except Exception as exc:
-            await interaction.followup.send(f"처리 중 오류가 발생했습니다.\n```{str(exc)[:1500]}```", ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "처리 중 오류가 발생했습니다",
+                f"```{str(exc)[:1500]}```",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
 
     @play.autocomplete("target_voice")
     async def target_voice_autocomplete(self, interaction: discord.Interaction, current: str):
@@ -542,11 +696,16 @@ class MusicCog(commands.Cog):
         effective_mode = self._effective_play_mode(mode, target_voice)
         source_dir: Path | None = None
         try:
-            status = await interaction.followup.send(f"{self._mode_label(effective_mode)} 모드 준비 중...")
+            mode_label = self._mode_label(effective_mode)
+            status = await self._send_followup_embed(
+                interaction,
+                f"{mode_label} 준비 중",
+                "업로드한 파일을 처리할 준비를 하고 있습니다.",
+            )
 
             async def progress(text: str) -> None:
                 try:
-                    await status.edit(content=text)
+                    await self._edit_processing_status(status, mode_label, text)
                 except discord.HTTPException:
                     pass
 
@@ -587,26 +746,31 @@ class MusicCog(commands.Cog):
             if play_in_voice:
                 await self._enqueue(interaction, song)
 
-            if play_in_voice and upload_file:
-                if uploaded:
-                    await status.edit(content=f"대기열에 추가하고 파일도 올렸습니다: **{song.title}**")
-                else:
-                    await status.edit(content=f"대기열에는 추가했지만 파일 업로드는 실패했습니다: **{song.title}**")
-            elif play_in_voice:
-                await status.edit(content=f"대기열에 추가했습니다: **{song.title}**")
-            else:
-                await status.edit(
-                    content=(
-                        f"파일을 올렸습니다: **{song.title}**"
-                        if uploaded
-                        else f"파일 업로드에 실패했습니다: **{song.title}**"
-                    )
-                )
+            await self._edit_play_result_status(
+                status,
+                song,
+                play_in_voice=play_in_voice,
+                upload_file=upload_file,
+                uploaded=uploaded,
+            )
+            if not play_in_voice:
                 self._cleanup_song(song)
         except OptionalFeatureMissing as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "기능을 사용할 수 없습니다",
+                str(exc),
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
         except Exception as exc:
-            await interaction.followup.send(f"처리 중 오류가 발생했습니다.\n```{str(exc)[:1500]}```", ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "처리 중 오류가 발생했습니다",
+                f"```{str(exc)[:1500]}```",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
         finally:
             if source_dir:
                 shutil.rmtree(source_dir, ignore_errors=True)
@@ -658,11 +822,16 @@ class MusicCog(commands.Cog):
         voice1_label = ORIGINAL_SINGER_NAME if is_original_singer_voice(voice1) else voice1
         voice2_label = ORIGINAL_SINGER_NAME if is_original_singer_voice(voice2) else voice2
         try:
-            status = await interaction.followup.send(f"{self._mode_label(effective_mode)} 모드 준비 중...")
+            mode_label = self._mode_label(effective_mode)
+            status = await self._send_followup_embed(
+                interaction,
+                f"{mode_label} 준비 중",
+                "AI 듀엣 커버를 처리할 준비를 하고 있습니다.",
+            )
 
             async def progress(text: str) -> None:
                 try:
-                    await status.edit(content=text)
+                    await self._edit_processing_status(status, mode_label, text)
                 except discord.HTTPException:
                     pass
 
@@ -701,26 +870,31 @@ class MusicCog(commands.Cog):
             if play_in_voice:
                 await self._enqueue(interaction, song)
 
-            if play_in_voice and upload_file:
-                if uploaded:
-                    await status.edit(content=f"대기열에 추가하고 파일도 올렸습니다: **{song.title}**")
-                else:
-                    await status.edit(content=f"대기열에는 추가했지만 파일 업로드는 실패했습니다: **{song.title}**")
-            elif play_in_voice:
-                await status.edit(content=f"대기열에 추가했습니다: **{song.title}**")
-            else:
-                await status.edit(
-                    content=(
-                        f"파일을 올렸습니다: **{song.title}**"
-                        if uploaded
-                        else f"파일 업로드에 실패했습니다: **{song.title}**"
-                    )
-                )
+            await self._edit_play_result_status(
+                status,
+                song,
+                play_in_voice=play_in_voice,
+                upload_file=upload_file,
+                uploaded=uploaded,
+            )
+            if not play_in_voice:
                 self._cleanup_song(song)
         except OptionalFeatureMissing as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "기능을 사용할 수 없습니다",
+                str(exc),
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
         except Exception as exc:
-            await interaction.followup.send(f"처리 중 오류가 발생했습니다.\n```{str(exc)[:1500]}```", ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "처리 중 오류가 발생했습니다",
+                f"```{str(exc)[:1500]}```",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
 
     @play_duet.autocomplete("voice1")
     async def play_duet_voice1_autocomplete(self, interaction: discord.Interaction, current: str):
@@ -749,7 +923,13 @@ class MusicCog(commands.Cog):
 
         tracks = await self.bot.youtube.get_playlist(url, max_count)
         if not tracks:
-            await interaction.followup.send("가져올 수 있는 곡을 찾지 못했습니다.", ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "플레이리스트를 찾지 못했습니다",
+                "가져올 수 있는 곡을 찾지 못했습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return
 
         state = self.state_for(interaction.guild_id)
@@ -758,7 +938,13 @@ class MusicCog(commands.Cog):
 
         await self._start_if_idle(interaction.guild_id)
         first = tracks[0].title
-        await interaction.followup.send(f"플레이리스트에서 **{len(tracks)}곡**을 추가했습니다.\n첫 곡: **{first}**")
+        embed = self._simple_embed(
+            "플레이리스트 추가 완료",
+            f"플레이리스트에서 **{len(tracks)}곡**을 추가했습니다.",
+            discord.Color.green(),
+        )
+        embed.add_field(name="첫 곡", value=f"**{first}**", inline=False)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="queue", description="현재 재생 중인 곡과 대기열을 봅니다.")
     async def queue(self, interaction: discord.Interaction):
@@ -800,28 +986,47 @@ class MusicCog(commands.Cog):
     async def remove(self, interaction: discord.Interaction, position: app_commands.Range[int, 1, 1000]):
         state = self.state_for(interaction.guild_id)
         if position > len(state.queue):
-            await interaction.response.send_message("그 번호의 대기열 곡이 없습니다.", ephemeral=True)
+            await self._send_response_embed(
+                interaction,
+                "대기열 곡을 찾지 못했습니다",
+                "그 번호의 대기열 곡이 없습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return
 
         songs = list(state.queue)
         removed = songs.pop(position - 1)
         state.queue = deque(songs)
         self._cleanup_song(removed)
-        await interaction.response.send_message(f"삭제했습니다: `#{position}` **{removed.title}**")
+        await self._send_response_embed(
+            interaction,
+            "대기열에서 삭제됨",
+            f"`#{position}` **{removed.title}**",
+            color=discord.Color.green(),
+        )
 
     @app_commands.command(name="loop", description="반복재생 모드를 설정합니다.")
     @app_commands.choices(mode=REPEAT_CHOICES)
     async def loop(self, interaction: discord.Interaction, mode: str):
         state = self.state_for(interaction.guild_id)
         state.repeat_mode = mode
-        await interaction.response.send_message(f"반복재생: **{self._repeat_label(mode)}**")
+        await self._send_response_embed(
+            interaction,
+            "반복재생 설정",
+            f"현재 모드: **{self._repeat_label(mode)}**",
+            color=discord.Color.blurple(),
+        )
 
     @app_commands.command(name="normalizer", description="곡 전체를 분석해서 곡끼리 음량을 맞춥니다.")
     async def normalizer(self, interaction: discord.Interaction, enabled: bool):
         state = self.state_for(interaction.guild_id)
         state.normalizer_enabled = enabled
-        await interaction.response.send_message(
-            f"노멀라이저를 **{'켰습니다' if enabled else '껐습니다'}**. 현재 곡 다음부터 재생용 파일에 적용됩니다."
+        await self._send_response_embed(
+            interaction,
+            "노멀라이저 설정",
+            f"노멀라이저를 **{'켰습니다' if enabled else '껐습니다'}**.\n현재 곡 다음부터 재생용 파일에 적용됩니다.",
+            color=discord.Color.blurple(),
         )
 
     @app_commands.command(name="skip", description="현재 곡을 건너뜁니다.")
@@ -829,37 +1034,76 @@ class MusicCog(commands.Cog):
         state = self.state_for(interaction.guild_id)
         voice_client = interaction.guild.voice_client
         if not voice_client or not state.current:
-            await interaction.response.send_message("현재 재생 중인 곡이 없습니다.", ephemeral=True)
+            await self._send_response_embed(
+                interaction,
+                "재생 중인 곡이 없습니다",
+                "현재 재생 중인 곡이 없습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return
 
         title = state.current.title
         state.skip_requested = True
         voice_client.stop()
-        await interaction.response.send_message(f"건너뛰었습니다: **{title}**")
+        await self._send_response_embed(
+            interaction,
+            "건너뜀",
+            f"**{title}**",
+            color=discord.Color.green(),
+        )
 
     @app_commands.command(name="pause", description="현재 곡을 일시정지합니다.")
     async def pause(self, interaction: discord.Interaction):
         voice_client = interaction.guild.voice_client
         if not voice_client or not voice_client.is_playing():
-            await interaction.response.send_message("일시정지할 곡이 없습니다.", ephemeral=True)
+            await self._send_response_embed(
+                interaction,
+                "일시정지할 곡이 없습니다",
+                "현재 일시정지할 수 있는 곡이 없습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return
         voice_client.pause()
-        await interaction.response.send_message("일시정지했습니다.")
+        await self._send_response_embed(
+            interaction,
+            "일시정지됨",
+            "현재 곡을 일시정지했습니다.",
+            color=discord.Color.blurple(),
+        )
 
     @app_commands.command(name="resume", description="일시정지된 곡을 다시 재생합니다.")
     async def resume(self, interaction: discord.Interaction):
         voice_client = interaction.guild.voice_client
         if not voice_client or not voice_client.is_paused():
-            await interaction.response.send_message("재개할 곡이 없습니다.", ephemeral=True)
+            await self._send_response_embed(
+                interaction,
+                "재개할 곡이 없습니다",
+                "현재 재개할 수 있는 곡이 없습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return
         voice_client.resume()
-        await interaction.response.send_message("다시 재생합니다.")
+        await self._send_response_embed(
+            interaction,
+            "재생 재개",
+            "다시 재생합니다.",
+            color=discord.Color.green(),
+        )
 
     @app_commands.command(name="nowplaying", description="현재 재생 중인 곡 정보를 봅니다.")
     async def nowplaying(self, interaction: discord.Interaction):
         state = self.state_for(interaction.guild_id)
         if not state.current:
-            await interaction.response.send_message("현재 재생 중인 곡이 없습니다.", ephemeral=True)
+            await self._send_response_embed(
+                interaction,
+                "재생 중인 곡이 없습니다",
+                "현재 재생 중인 곡이 없습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return
         song = state.current
         embed = discord.Embed(title="지금 재생 중", description=f"[{song.title}]({song.url})", color=discord.Color.green())
@@ -877,12 +1121,24 @@ class MusicCog(commands.Cog):
         state = self.state_for(interaction.guild_id)
         search_query = query or (state.current.title if state.current else None)
         if not search_query:
-            await interaction.followup.send("검색어가 없고 현재 재생 중인 곡도 없습니다.", ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "검색어가 필요합니다",
+                "검색어가 없고 현재 재생 중인 곡도 없습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return
 
         result = await self.bot.lyrics.search(search_query)
         if not result:
-            await interaction.followup.send("가사를 찾지 못했습니다.", ephemeral=True)
+            await self._send_followup_embed(
+                interaction,
+                "가사를 찾지 못했습니다",
+                "검색 결과에서 가사를 찾지 못했습니다.",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
             return
 
         view = LyricsView(result.title, result.artist, result.pages)
@@ -946,17 +1202,21 @@ class MusicCog(commands.Cog):
                         pass
             return True
         except (OSError, RuntimeError, discord.HTTPException) as exc:
-            await interaction.followup.send(
-                f"파일 업로드에 실패했습니다.\n```{str(exc)[:800]}```",
+            await self._send_followup_embed(
+                interaction,
+                "파일 업로드 실패",
+                f"```{str(exc)[:800]}```",
+                color=discord.Color.red(),
                 ephemeral=True,
             )
             return False
 
     async def _send_file_message(self, interaction: discord.Interaction, content: str, path: Path) -> None:
+        embed = self._simple_embed("파일 업로드", content, discord.Color.green())
         if interaction.channel:
-            await interaction.channel.send(content=content, file=discord.File(path))
+            await interaction.channel.send(embed=embed, file=discord.File(path))
         else:
-            await interaction.followup.send(content=content, file=discord.File(path))
+            await interaction.followup.send(embed=embed, file=discord.File(path))
 
     async def _split_song_file_for_upload(self, path: Path, song: Song, upload_limit: int) -> list[Path]:
         temp_root = Path("tmp")

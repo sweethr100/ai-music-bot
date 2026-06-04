@@ -224,11 +224,11 @@ class RVCEngine:
             "--f0_method",
             os.getenv("RVC_INFER_F0_METHOD", "rmvpe"),
             "--index_rate",
-            os.getenv("RVC_INFER_INDEX_RATE", "0.35"),
+            os.getenv("RVC_INFER_INDEX_RATE", "0.25"),
             "--volume_envelope",
-            os.getenv("RVC_INFER_VOLUME_ENVELOPE", "0.80"),
+            os.getenv("RVC_INFER_VOLUME_ENVELOPE", "0.75"),
             "--protect",
-            os.getenv("RVC_INFER_PROTECT", "0.45"),
+            os.getenv("RVC_INFER_PROTECT", "0.50"),
             "--input_path",
             str(vocals.resolve()),
             "--output_path",
@@ -1048,7 +1048,7 @@ class AIProcessor:
     async def _prepare_vocals_for_conversion(self, vocals: Path, work_dir: Path, progress) -> Path:
         filter_chain = os.getenv(
             "AI_COVER_INPUT_VOCAL_FILTER",
-            "aresample=48000,highpass=f=40,lowpass=f=19000,loudnorm=I=-17:TP=-2:LRA=10,aresample=48000",
+            "none",
         ).strip()
         if not filter_chain or filter_chain.lower() in {"off", "false", "none"}:
             return vocals
@@ -1061,7 +1061,7 @@ class AIProcessor:
     async def _polish_converted_vocal(self, vocal: Path, work_dir: Path) -> Path:
         filter_chain = os.getenv(
             "AI_COVER_OUTPUT_VOCAL_FILTER",
-            "aresample=48000,highpass=f=45,equalizer=f=4500:t=q:w=1.2:g=0.9,deesser=i=0.35:m=0.45:f=0.55,alimiter=limit=0.96",
+            "none",
         ).strip()
         if not filter_chain or filter_chain.lower() in {"off", "false", "none"}:
             return vocal
@@ -1101,9 +1101,9 @@ class AIProcessor:
         profile: str = "default",
     ) -> None:
         if profile == "cover":
-            vocal_volume = "1.12"
-            inst_volume = "0.70"
-            master_filter = "loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.98"
+            vocal_volume = "1.0"
+            inst_volume = "0.80"
+            master_filter = "alimiter=limit=0.98"
         elif profile == "boost" or vocal_boost:
             vocal_volume = "1.30"
             inst_volume = "0.58"

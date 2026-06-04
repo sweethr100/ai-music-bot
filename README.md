@@ -128,11 +128,11 @@ AI 커버는 기본적으로 `audio-separator`의 Roformer 보컬 특화 모델�
 VOCAL_SEPARATOR_BACKEND=auto
 VOCAL_SEPARATOR_MODEL=mel_band_roformer_kim_ft_unwa.ckpt
 RVC_INFER_F0_METHOD=rmvpe
-RVC_INFER_INDEX_RATE=0.35
-RVC_INFER_VOLUME_ENVELOPE=0.80
-RVC_INFER_PROTECT=0.45
-AI_COVER_INPUT_VOCAL_FILTER=aresample=48000,highpass=f=40,lowpass=f=19000,loudnorm=I=-17:TP=-2:LRA=10,aresample=48000
-AI_COVER_OUTPUT_VOCAL_FILTER=aresample=48000,highpass=f=45,equalizer=f=4500:t=q:w=1.2:g=0.9,deesser=i=0.35:m=0.45:f=0.55,alimiter=limit=0.96
+RVC_INFER_INDEX_RATE=0.25
+RVC_INFER_VOLUME_ENVELOPE=0.75
+RVC_INFER_PROTECT=0.50
+AI_COVER_INPUT_VOCAL_FILTER=none
+AI_COVER_OUTPUT_VOCAL_FILTER=none
 ```
 
 AI 듀엣은 `/play_duet`에서 `voice1`과 `voice2`를 고르면 실행됩니다. 두 옵션은 모두 필수이며, 원곡 가수를 그대로 둘 파트는 `원본 가수`를 선택합니다. 기본값은 추가 모델 설치 없이 내장 NMF 분리기를 사용합니다.
