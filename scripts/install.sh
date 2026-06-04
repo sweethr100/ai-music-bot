@@ -20,16 +20,6 @@ install_cuda_torch() {
     "torchaudio==${TORCHAUDIO_VERSION}" \
     "pillow<12.0,>=8.0" \
     --index-url "$TORCH_INDEX"
-  install_audio_save_dependencies "$python_exe"
-}
-
-install_audio_save_dependencies() {
-  local python_exe="$1"
-  local torchcodec_requirement
-  torchcodec_requirement="$("$python_exe" "$ROOT/scripts/torchcodec_requirement.py")"
-
-  "$python_exe" -m pip install "soundfile>=0.12.1"
-  "$python_exe" -m pip install "$torchcodec_requirement"
 }
 
 install_requirements_without_torch() {
@@ -37,7 +27,7 @@ install_requirements_without_torch() {
   local requirements_path="$2"
   local filtered_requirements
   filtered_requirements="$(mktemp)"
-  grep -Ev '^(torch|torchaudio|torchvision|torchcodec)([=<>!~; ].*)?$' "$requirements_path" > "$filtered_requirements"
+  grep -Ev '^(torch|torchaudio|torchvision)([=<>!~; ].*)?$' "$requirements_path" > "$filtered_requirements"
   "$python_exe" -m pip install -r "$filtered_requirements"
 }
 
@@ -60,12 +50,6 @@ test_cuda_torch() {
   "$python_exe" -c "import torch; assert torch.cuda.is_available(), 'CUDA is not available'; print('${label} CUDA OK:', torch.__version__, torch.cuda.get_device_name(0))"
 }
 
-test_audio_save() {
-  local python_exe="$1"
-  local label="$2"
-  "$python_exe" -c "import tempfile, torch, torchaudio; path = tempfile.mktemp(suffix='.wav'); torchaudio.save(path, torch.zeros(1, 16000), 16000); print('${label} audio save OK:', path)"
-}
-
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "nvidia-smi를 찾지 못했습니다. NVIDIA 드라이버를 먼저 설치한 뒤 다시 실행해 주세요." >&2
   exit 1
@@ -85,7 +69,6 @@ echo "Installing bot + AI music dependencies..."
 python -m pip install -r "$ROOT/requirements.txt"
 install_cuda_torch python
 test_cuda_torch python "Bot"
-test_audio_save python "Bot"
 
 mkdir -p "$VENDOR_DIR"
 
@@ -114,7 +97,6 @@ if [ -f "$APPLIO_DIR/requirements.txt" ]; then
 fi
 
 test_cuda_torch "$APPLIO_DIR/env/bin/python" "Applio"
-test_audio_save "$APPLIO_DIR/env/bin/python" "Applio"
 
 mkdir -p "$ROOT/voice_models"
 mkdir -p "$ROOT/data/recordings"

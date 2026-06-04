@@ -8,7 +8,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -964,17 +963,13 @@ class AIProcessor:
         backend = os.getenv("VOCAL_SEPARATOR_BACKEND", "auto").strip().lower()
         if backend in {"auto", "audio-separator", "audio_separator", "roformer"}:
             model_name = os.getenv("VOCAL_SEPARATOR_MODEL", DEFAULT_SEPARATOR_MODEL)
-            await progress(f"고품질 보컬 분리 모델을 실행하는 중... ({model_name})")
+            await progress("보컬 분리 모델 실행하는 중...")
             try:
                 return await self._separate_with_audio_separator(input_wav, work_dir, model_name)
             except OptionalFeatureMissing as exc:
                 raise OptionalFeatureMissing("고품질 보컬 분리 엔진을 실행하지 못했습니다.") from exc
             except Exception as exc:
                 raise RuntimeError(f"고품질 보컬 분리가 실패했습니다.\n{str(exc)[-1200:]}") from exc
-
-        if backend == "demucs":
-            await progress("Demucs로 보컬과 반주를 분리하는 중... 처음 실행은 모델 다운로드 때문에 오래 걸릴 수 있습니다.")
-            return await self._separate_with_demucs(input_wav, work_dir)
 
         raise ValueError(f"지원하지 않는 VOCAL_SEPARATOR_BACKEND 값입니다: {backend}")
 
@@ -1050,61 +1045,10 @@ class AIProcessor:
 
         return None
 
-    async def _separate_with_demucs(self, input_wav: Path, work_dir: Path) -> tuple[Path, Path]:
-        output_root = work_dir / "demucs"
-        cmd = [
-            sys.executable,
-            "-m",
-            "demucs",
-            "--two-stems=vocals",
-            "-d",
-            "cuda",
-            "--out",
-            str(output_root),
-            str(input_wav),
-        ]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            message = (stderr or stdout).decode("utf-8", errors="ignore")
-            if "TorchCodec" in message or "torchcodec" in message:
-                raise OptionalFeatureMissing(
-                    "보컬 분리 결과를 저장하는 데 필요한 TorchCodec이 없거나 PyTorch 버전과 맞지 않습니다. "
-                    "`scripts/install.ps1` 또는 `scripts/install.sh`를 다시 실행해 주세요.\n"
-                    f"{message[-700:]}"
-                )
-            if "Couldn't find appropriate backend" in message or "audio backend" in message:
-                raise OptionalFeatureMissing(
-                    "보컬 분리 결과를 저장할 오디오 백엔드를 찾지 못했습니다. "
-                    "`scripts/install.ps1` 또는 `scripts/install.sh`를 다시 실행해 주세요.\n"
-                    f"{message[-700:]}"
-                )
-            raise OptionalFeatureMissing(
-                "CUDA 보컬 분리 엔진을 실행하지 못했습니다. NVIDIA 드라이버와 CUDA PyTorch 설치를 확인한 뒤 "
-                "`scripts/install.ps1` 또는 `scripts/install.sh`를 다시 실행해 주세요.\n"
-                f"{message[-700:]}"
-            )
-
-        matches = list(output_root.glob("*/input/vocals.wav"))
-        if not matches:
-            matches = list(output_root.glob("**/vocals.wav"))
-        if not matches:
-            raise RuntimeError("Demucs 결과에서 vocals.wav를 찾지 못했습니다.")
-
-        vocals = matches[0]
-        instrumental = vocals.with_name("no_vocals.wav")
-        if not instrumental.exists():
-            raise RuntimeError("Demucs 결과에서 no_vocals.wav를 찾지 못했습니다.")
-        return vocals, instrumental
-
     async def _prepare_vocals_for_conversion(self, vocals: Path, work_dir: Path, progress) -> Path:
         filter_chain = os.getenv(
             "AI_COVER_INPUT_VOCAL_FILTER",
-            "aresample=48000,highpass=f=45,lowpass=f=17000,loudnorm=I=-18:TP=-3:LRA=11,aresample=48000",
+            "aresample=48000,highpass=f=40,lowpass=f=19000,loudnorm=I=-17:TP=-2:LRA=10,aresample=48000",
         ).strip()
         if not filter_chain or filter_chain.lower() in {"off", "false", "none"}:
             return vocals
@@ -1117,7 +1061,7 @@ class AIProcessor:
     async def _polish_converted_vocal(self, vocal: Path, work_dir: Path) -> Path:
         filter_chain = os.getenv(
             "AI_COVER_OUTPUT_VOCAL_FILTER",
-            "aresample=48000,highpass=f=55,lowpass=f=15500,alimiter=limit=0.96",
+            "aresample=48000,highpass=f=45,equalizer=f=4500:t=q:w=1.2:g=0.9,deesser=i=0.35:m=0.45:f=0.55,alimiter=limit=0.96",
         ).strip()
         if not filter_chain or filter_chain.lower() in {"off", "false", "none"}:
             return vocal
@@ -1157,8 +1101,8 @@ class AIProcessor:
         profile: str = "default",
     ) -> None:
         if profile == "cover":
-            vocal_volume = "1.08"
-            inst_volume = "0.78"
+            vocal_volume = "1.12"
+            inst_volume = "0.70"
             master_filter = "loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.98"
         elif profile == "boost" or vocal_boost:
             vocal_volume = "1.30"

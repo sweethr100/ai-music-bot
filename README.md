@@ -122,7 +122,7 @@ voice_models/
 
 ## AI 커버 품질 튜닝
 
-AI 커버는 기본적으로 `audio-separator`의 Roformer 보컬 특화 모델을 사용합니다. 이 모델이 실패하면 Demucs로 fallback하지 않고 처리를 중단합니다. 분리 모델과 RVC 추론값은 `.env`에서 조절할 수 있습니다.
+AI 커버는 기본적으로 `audio-separator`의 Roformer 보컬 특화 모델을 사용합니다. 이 모델이 실패하면 처리를 중단합니다. 분리 모델과 RVC 추론값은 `.env`에서 조절할 수 있습니다.
 
 ```env
 VOCAL_SEPARATOR_BACKEND=auto
@@ -131,17 +131,17 @@ RVC_INFER_F0_METHOD=rmvpe
 RVC_INFER_INDEX_RATE=0.35
 RVC_INFER_VOLUME_ENVELOPE=0.80
 RVC_INFER_PROTECT=0.45
-AI_COVER_INPUT_VOCAL_FILTER=aresample=48000,highpass=f=45,lowpass=f=17000,loudnorm=I=-18:TP=-3:LRA=11,aresample=48000
-AI_COVER_OUTPUT_VOCAL_FILTER=aresample=48000,highpass=f=55,lowpass=f=15500,alimiter=limit=0.96
+AI_COVER_INPUT_VOCAL_FILTER=aresample=48000,highpass=f=40,lowpass=f=19000,loudnorm=I=-17:TP=-2:LRA=10,aresample=48000
+AI_COVER_OUTPUT_VOCAL_FILTER=aresample=48000,highpass=f=45,equalizer=f=4500:t=q:w=1.2:g=0.9,deesser=i=0.35:m=0.45:f=0.55,alimiter=limit=0.96
 ```
 
-AI 듀엣은 `/play_duet`에서 `duet_voice`에 두 번째 목소리를 고르면 실행됩니다. `target_voice`를 비우면 1번 파트는 원본 가수로 처리합니다. 기본값은 설치만으로 동작하는 내장 자동 듀엣 분리기를 사용합니다.
+AI 듀엣은 `/play_duet`에서 `voice1`과 `voice2`를 고르면 실행됩니다. 두 옵션은 모두 필수이며, 원곡 가수를 그대로 둘 파트는 `원본 가수`를 선택합니다. 기본값은 추가 모델 설치 없이 내장 NMF 분리기를 사용합니다.
 
-별도 multi-singer 모델을 쓰고 싶을 때만 아래 값을 설정합니다. Asteroid/Hugging Face 모델은 `asteroid`를 따로 설치해야 하며, Windows에서는 `pesq` 빌드를 위해 Microsoft C++ Build Tools가 필요할 수 있습니다.
+별도 multi-singer 모델을 쓰고 싶을 때만 아래 값을 `.env`에 넣습니다. Hugging Face/Asteroid 모델은 `asteroid`를 따로 설치해야 하며, Windows에서는 `pesq` 빌드를 위해 Microsoft C++ Build Tools가 필요할 수 있습니다.
 
 ```env
-MULTI_SINGER_SEPARATOR_BACKEND=auto
-MULTI_SINGER_SEPARATOR_MODEL=
+MULTI_SINGER_SEPARATOR_BACKEND=asteroid
+MULTI_SINGER_SEPARATOR_MODEL=Cyru5/MedleyVox
 MULTI_SINGER_SEPARATOR_DEVICE=cuda
 ```
 
@@ -161,7 +161,7 @@ MULTI_SINGER_SEPARATOR_COMMAND=python path/to/infer.py --input {input} --output_
 
 녹음 파일은 48kHz stereo PCM WAV로 저장되고, 한 파일이 약 5분 분량에 도달하면 자동으로 다음 파일로 분할됩니다. 봇이나 음성 수신이 일시적으로 끊겨도 WAV 헤더를 주기적으로 갱신해 손상 가능성을 줄입니다.
 
-녹음을 끝낼 때는 `/record_stop`을 실행합니다. 이후 `/train_voice dataset:<유저 데이터셋> model_name:<목소리이름>`을 실행하면 Applio RVC 학습 파이프라인이 돌아가고, 결과가 `voice_models/<목소리이름>/`에 저장됩니다. 학습이 끝난 모델은 `/play`의 `target_voice`와 `/play_duet`의 `target_voice`, `duet_voice` 자동완성에 바로 표시됩니다.
+녹음을 끝낼 때는 `/record_stop`을 실행합니다. 이후 `/train_voice dataset:<유저 데이터셋> model_name:<목소리이름>`을 실행하면 Applio RVC 학습 파이프라인이 돌아가고, 결과가 `voice_models/<목소리이름>/`에 저장됩니다. 학습이 끝난 모델은 `/play`의 `target_voice`와 `/play_duet`의 `voice1`, `voice2` 자동완성에 바로 표시됩니다.
 
 학습 기본값:
 
@@ -208,8 +208,8 @@ python bot.py
 /play query:https://youtu.be/... target_voice:myvoice vocal_pitch_shift:+6
 /play_file file:<업로드 파일> mode:원본 재생
 /play_file file:<업로드 파일> target_voice:myvoice vocal_pitch_shift:+6
-/play_duet query:artist duet song duet_voice:voice2
-/play_duet query:artist duet song target_voice:voice1 duet_voice:voice2
+/play_duet query:artist duet song voice1:원본 가수 voice2:voice2
+/play_duet query:artist duet song voice1:voice1 voice2:voice2
 /record_start
 /record_status
 /record_stop

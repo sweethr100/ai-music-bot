@@ -306,7 +306,7 @@ class VoiceRecordingCog(commands.Cog):
         music_active = bool(music_state and (music_state.is_playing or music_state.current or music_state.queue))
 
         if music_active:
-            await guild.change_voice_state(channel=voice_client.channel, self_deaf=True)
+            await guild.change_voice_state(channel=voice_client.channel, self_deaf=False)
             return
 
         await voice_client.disconnect()

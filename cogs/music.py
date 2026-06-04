@@ -34,14 +34,6 @@ YOUTUBE_MODE_CHOICES = [
     app_commands.Choice(name="보컬 강조 믹스", value="vocal_boost"),
 ]
 
-VOCAL_PITCH_CHOICES = [
-    app_commands.Choice(name="그대로 (0)", value=0),
-    app_commands.Choice(name="목소리 높게: 남자목소리->여자목소리 (+6)", value=6),
-    app_commands.Choice(name="목소리 낮게: 여자목소리->남자목소리 (-6)", value=-6),
-    app_commands.Choice(name="많이 높게 (+12)", value=12),
-    app_commands.Choice(name="많이 낮게 (-12)", value=-12),
-]
-
 DELIVERY_CHOICES = [
     app_commands.Choice(name="파일 올리고 통화방에서도 틀기", value="upload_and_play"),
     app_commands.Choice(name="파일만 채팅에 올리기", value="upload_only"),
@@ -155,11 +147,28 @@ class MusicCog(commands.Cog):
 
         voice_client = interaction.guild.voice_client
         if voice_client and voice_client.is_connected():
+            await interaction.guild.change_voice_state(channel=voice_client.channel, self_deaf=False)
             if voice_client.channel != channel:
+                if self._voice_client_busy(interaction.guild_id, voice_client):
+                    await interaction.followup.send(
+                        f"이미 **{voice_client.channel.name}**에서 재생 중이라 "
+                        "새 요청은 현재 재생 채널의 대기열에 넣습니다.",
+                        ephemeral=True,
+                    )
+                    return voice_client
                 await voice_client.move_to(channel)
+                await interaction.guild.change_voice_state(channel=channel, self_deaf=False)
             return voice_client
 
-        return await channel.connect(cls=PatchedVoiceRecvClient, self_deaf=True)
+        return await channel.connect(cls=PatchedVoiceRecvClient, self_deaf=False)
+
+    def _voice_client_busy(self, guild_id: int, voice_client: discord.VoiceClient | None) -> bool:
+        state = self.state_for(guild_id)
+        return bool(
+            state.current
+            or state.is_playing
+            or (voice_client and (voice_client.is_playing() or voice_client.is_paused()))
+        )
 
     async def _resolve_voice_channel_option(
         self,
@@ -229,11 +238,13 @@ class MusicCog(commands.Cog):
 
         if song.is_local:
             source_path = await self._prepare_playback_path(song, normalizer_enabled)
-            return discord.FFmpegPCMAudio(
+            source = discord.FFmpegPCMAudio(
                 source_path,
                 executable=ffmpeg.executable(),
                 options=options,
             )
+            ffmpeg.prioritize_playback_process(getattr(source, "_process", None))
+            return source
 
         if normalizer_enabled:
             exported = await self.bot.ai_processor.export_youtube_audio(song.url, self._noop_progress)
@@ -241,20 +252,24 @@ class MusicCog(commands.Cog):
             song.playback_path = str(
                 await self.bot.ai_processor.normalize_for_playback(Path(exported.path), song.title)
             )
-            return discord.FFmpegPCMAudio(
+            source = discord.FFmpegPCMAudio(
                 song.playback_path,
                 executable=ffmpeg.executable(),
                 options=options,
             )
+            ffmpeg.prioritize_playback_process(getattr(source, "_process", None))
+            return source
 
         song.track.stream_url = None
         await self.bot.youtube.resolve_stream(song.track)
-        return discord.FFmpegOpusAudio(
+        source = discord.FFmpegOpusAudio(
             song.track.stream_url,
             executable=ffmpeg.executable(),
             before_options=ffmpeg.reconnect_options(),
             options=options,
         )
+        ffmpeg.prioritize_playback_process(getattr(source, "_process", None))
+        return source
 
     async def _prepare_playback_path(self, song: Song, normalizer_enabled: bool) -> str:
         if not normalizer_enabled:
@@ -374,19 +389,19 @@ class MusicCog(commands.Cog):
         query="유튜브 URL 또는 검색어",
         mode="원본, MR, 보컬, 보컬 강조 중 선택",
         target_voice="AI 커버 목소리 이름",
-        vocal_pitch_shift="목소리 피치만 조절. 예: -6 여자목소리->남자목소리, +6 남자목소리->여자목소리",
+        vocal_pitch_shift="목소리 피치만 조절. -12부터 +12까지 정수로 입력",
         delivery="결과 파일을 채팅에 올릴지, 통화방에서 틀지도 함께 선택",
         voice_channel="명령어 사용자가 음성 채널에 없어도 재생할 음성 채널",
         connected_voice_channel="현재 접속자가 있는 음성 채널 중에서 선택",
     )
-    @app_commands.choices(mode=YOUTUBE_MODE_CHOICES, vocal_pitch_shift=VOCAL_PITCH_CHOICES, delivery=DELIVERY_CHOICES)
+    @app_commands.choices(mode=YOUTUBE_MODE_CHOICES, delivery=DELIVERY_CHOICES)
     async def play(
         self,
         interaction: discord.Interaction,
         query: str,
         mode: str = "original",
         target_voice: str | None = None,
-        vocal_pitch_shift: int = 0,
+        vocal_pitch_shift: app_commands.Range[int, -12, 12] = 0,
         delivery: str = "upload_and_play",
         voice_channel: discord.VoiceChannel | None = None,
         connected_voice_channel: str | None = None,
@@ -494,19 +509,19 @@ class MusicCog(commands.Cog):
         file="재생하거나 처리할 오디오/동영상 파일",
         mode="원본, MR, 보컬, 보컬 강조 중 선택",
         target_voice="AI 커버 목소리 이름",
-        vocal_pitch_shift="목소리 피치만 조절. 예: -6 여자목소리->남자목소리, +6 남자목소리->여자목소리",
+        vocal_pitch_shift="목소리 피치만 조절. -12부터 +12까지 정수로 입력",
         delivery="결과 파일을 채팅에 올릴지, 통화방에서 틀지도 함께 선택",
         voice_channel="명령어 사용자가 음성 채널에 없어도 재생할 음성 채널",
         connected_voice_channel="현재 접속자가 있는 음성 채널 중에서 선택",
     )
-    @app_commands.choices(mode=YOUTUBE_MODE_CHOICES, vocal_pitch_shift=VOCAL_PITCH_CHOICES, delivery=DELIVERY_CHOICES)
+    @app_commands.choices(mode=YOUTUBE_MODE_CHOICES, delivery=DELIVERY_CHOICES)
     async def play_file(
         self,
         interaction: discord.Interaction,
         file: discord.Attachment,
         mode: str = "original",
         target_voice: str | None = None,
-        vocal_pitch_shift: int = 0,
+        vocal_pitch_shift: app_commands.Range[int, -12, 12] = 0,
         delivery: str = "upload_and_play",
         voice_channel: discord.VoiceChannel | None = None,
         connected_voice_channel: str | None = None,
@@ -607,21 +622,21 @@ class MusicCog(commands.Cog):
     @app_commands.command(name="play_duet", description="AI 듀엣 커버를 가수별 자동 분리로 만듭니다.")
     @app_commands.describe(
         query="유튜브 URL 또는 검색어",
-        duet_voice="AI 듀엣 2번 목소리 이름",
-        target_voice="AI 듀엣 1번 목소리 이름. 비우면 원본 가수를 사용합니다.",
-        vocal_pitch_shift="목소리 피치만 조절. 예: -6 여자목소리->남자목소리, +6 남자목소리->여자목소리",
+        voice1="AI 듀엣 1번 목소리 이름",
+        voice2="AI 듀엣 2번 목소리 이름",
+        vocal_pitch_shift="목소리 피치만 조절. -12부터 +12까지 정수로 입력",
         delivery="결과 파일을 채팅에 올릴지, 통화방에서 틀지도 함께 선택",
         voice_channel="명령어 사용자가 음성 채널에 없어도 재생할 음성 채널",
         connected_voice_channel="현재 접속자가 있는 음성 채널 중에서 선택",
     )
-    @app_commands.choices(vocal_pitch_shift=VOCAL_PITCH_CHOICES, delivery=DELIVERY_CHOICES)
+    @app_commands.choices(delivery=DELIVERY_CHOICES)
     async def play_duet(
         self,
         interaction: discord.Interaction,
         query: str,
-        duet_voice: str,
-        target_voice: str | None = None,
-        vocal_pitch_shift: int = 0,
+        voice1: str,
+        voice2: str,
+        vocal_pitch_shift: app_commands.Range[int, -12, 12] = 0,
         delivery: str = "upload_and_play",
         voice_channel: discord.VoiceChannel | None = None,
         connected_voice_channel: str | None = None,
@@ -640,9 +655,8 @@ class MusicCog(commands.Cog):
                 return
 
         effective_mode = "ai_duet"
-        target_voice = target_voice or ORIGINAL_SINGER_VALUE
-        target_voice_label = ORIGINAL_SINGER_NAME if is_original_singer_voice(target_voice) else target_voice
-        duet_voice_label = ORIGINAL_SINGER_NAME if is_original_singer_voice(duet_voice) else duet_voice
+        voice1_label = ORIGINAL_SINGER_NAME if is_original_singer_voice(voice1) else voice1
+        voice2_label = ORIGINAL_SINGER_NAME if is_original_singer_voice(voice2) else voice2
         try:
             status = await interaction.followup.send(f"{self._mode_label(effective_mode)} 모드 준비 중...")
 
@@ -655,10 +669,10 @@ class MusicCog(commands.Cog):
             processed = await self.bot.ai_processor.process_youtube(
                 url=query,
                 mode=effective_mode,
-                target_voice=target_voice,
+                target_voice=voice1,
                 vocal_pitch_shift=vocal_pitch_shift,
                 progress=progress,
-                duet_voice=duet_voice,
+                duet_voice=voice2,
             )
             track = TrackInfo(
                 title=f"[{self._mode_label(effective_mode)}] {processed.title}",
@@ -672,8 +686,8 @@ class MusicCog(commands.Cog):
                 interaction.user.display_name,
                 local_path=processed.path,
                 mode=effective_mode,
-                target_voice=target_voice_label,
-                duet_voice=duet_voice_label,
+                target_voice=voice1_label,
+                duet_voice=voice2_label,
                 vocal_pitch_shift=vocal_pitch_shift,
             )
 
@@ -708,12 +722,12 @@ class MusicCog(commands.Cog):
         except Exception as exc:
             await interaction.followup.send(f"처리 중 오류가 발생했습니다.\n```{str(exc)[:1500]}```", ephemeral=True)
 
-    @play_duet.autocomplete("target_voice")
-    async def play_duet_target_voice_autocomplete(self, interaction: discord.Interaction, current: str):
+    @play_duet.autocomplete("voice1")
+    async def play_duet_voice1_autocomplete(self, interaction: discord.Interaction, current: str):
         return self._voice_autocomplete_choices(current, include_original=True)
 
-    @play_duet.autocomplete("duet_voice")
-    async def play_duet_duet_voice_autocomplete(self, interaction: discord.Interaction, current: str):
+    @play_duet.autocomplete("voice2")
+    async def play_duet_voice2_autocomplete(self, interaction: discord.Interaction, current: str):
         return self._voice_autocomplete_choices(current, include_original=True)
 
     @play_duet.autocomplete("connected_voice_channel")

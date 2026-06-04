@@ -35,19 +35,6 @@ function Install-CudaTorch {
         "pillow<12.0,>=8.0",
         "--index-url", $TorchIndex
     )
-    Install-AudioSaveDependencies -PythonExe $PythonExe
-}
-
-function Install-AudioSaveDependencies {
-    param([string]$PythonExe)
-
-    $TorchCodecRequirement = & $PythonExe (Join-Path $Root "scripts\torchcodec_requirement.py")
-    if ($LASTEXITCODE -ne 0) {
-        throw "TorchCodec 호환 버전을 고르지 못했습니다."
-    }
-
-    Invoke-Checked $PythonExe @("-m", "pip", "install", "soundfile>=0.12.1")
-    Invoke-Checked $PythonExe @("-m", "pip", "install", $TorchCodecRequirement)
 }
 
 function Install-RequirementsWithoutTorch {
@@ -55,7 +42,7 @@ function Install-RequirementsWithoutTorch {
 
     $FilteredRequirements = Join-Path ([System.IO.Path]::GetTempPath()) "applio-requirements-no-torch.txt"
     Get-Content $RequirementsPath | Where-Object {
-        $_ -notmatch '^(torch|torchaudio|torchvision|torchcodec)([=<>!~; ].*)?$'
+        $_ -notmatch '^(torch|torchaudio|torchvision)([=<>!~; ].*)?$'
     } | Set-Content -Path $FilteredRequirements -Encoding UTF8
     Invoke-Checked $PythonExe @("-m", "pip", "install", "-r", $FilteredRequirements)
 }
@@ -88,11 +75,6 @@ function Test-CudaTorch {
     Invoke-Checked $PythonExe @("-c", "import torch; assert torch.cuda.is_available(), 'CUDA is not available'; print('$Label CUDA OK:', torch.__version__, torch.cuda.get_device_name(0))")
 }
 
-function Test-AudioSave {
-    param([string]$PythonExe, [string]$Label)
-    Invoke-Checked $PythonExe @("-c", "import tempfile, torch, torchaudio; path = tempfile.mktemp(suffix='.wav'); torchaudio.save(path, torch.zeros(1, 16000), 16000); print('$Label audio save OK:', path)")
-}
-
 if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
     throw "nvidia-smi를 찾지 못했습니다. NVIDIA 드라이버를 먼저 설치한 뒤 다시 실행해 주세요."
 }
@@ -110,7 +92,6 @@ Write-Host "Installing bot + AI music dependencies..."
 Invoke-Checked "python" @("-m", "pip", "install", "-r", (Join-Path $Root "requirements.txt"))
 Install-CudaTorch -PythonExe "python"
 Test-CudaTorch -PythonExe "python" -Label "Bot"
-Test-AudioSave -PythonExe "python" -Label "Bot"
 
 if (-not (Test-Path $VendorDir)) {
     New-Item -ItemType Directory -Path $VendorDir | Out-Null
@@ -144,7 +125,6 @@ if (Test-Path $ApplioRequirements) {
 }
 
 Test-CudaTorch -PythonExe $ApplioPython -Label "Applio"
-Test-AudioSave -PythonExe $ApplioPython -Label "Applio"
 
 $VoiceModels = Join-Path $Root "voice_models"
 if (-not (Test-Path $VoiceModels)) {
