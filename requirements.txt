@@ -7,3 +7,6 @@ aiohttp>=3.9.5
 imageio-ffmpeg>=0.5.1
 demucs>=4.0.1
 soundfile>=0.12.1
+audio-separator[gpu]>=0.44.2
+librosa>=0.11.0
+scikit-learn>=1.4.0

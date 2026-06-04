@@ -3,6 +3,9 @@ set -euo pipefail
 
 APPLIO_REPO="${APPLIO_REPO:-https://github.com/IAHispano/Applio.git}"
 TORCH_CUDA="${TORCH_CUDA:-cu128}"
+TORCH_VERSION="${TORCH_VERSION:-2.8.0}"
+TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.23.0}"
+TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-2.8.0}"
 TORCH_INDEX="https://download.pytorch.org/whl/${TORCH_CUDA}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR_DIR="$ROOT/vendor"
@@ -11,40 +14,44 @@ APPLIO_DIR="$VENDOR_DIR/Applio"
 install_cuda_torch() {
   local python_exe="$1"
   "$python_exe" -m pip install -U pip
-  "$python_exe" -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url "$TORCH_INDEX"
+  "$python_exe" -m pip install --upgrade --force-reinstall \
+    "torch==${TORCH_VERSION}" \
+    "torchvision==${TORCHVISION_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION}" \
+    "pillow<12.0,>=8.0" \
+    --index-url "$TORCH_INDEX"
   install_audio_save_dependencies "$python_exe"
 }
 
 install_audio_save_dependencies() {
   local python_exe="$1"
   local torchcodec_requirement
-  torchcodec_requirement="$("$python_exe" -c '
-import sys
-import torch
-
-version = torch.__version__.split("+", 1)[0].split(".")
-major, minor = int(version[0]), int(version[1])
-if sys.version_info >= (3, 13) and (major, minor) < (2, 8):
-    raise SystemExit(
-        f"Python 3.13에서 TorchCodec을 쓰려면 torch 2.8 이상이 필요합니다. "
-        f"현재 torch는 {torch.__version__}입니다. `TORCH_CUDA=cu128`로 다시 설치하거나 Python 3.12 venv를 사용해 주세요."
-    )
-if (major, minor) >= (2, 11):
-    print("torchcodec")
-elif (major, minor) == (2, 10):
-    print("torchcodec==0.10.*")
-elif (major, minor) == (2, 9):
-    print("torchcodec==0.9.*")
-elif (major, minor) == (2, 8):
-    print("torchcodec==0.7.*")
-elif (major, minor) == (2, 7):
-    print("torchcodec==0.5.*")
-else:
-    print("torchcodec==0.2.*")
-')"
+  torchcodec_requirement="$("$python_exe" "$ROOT/scripts/torchcodec_requirement.py")"
 
   "$python_exe" -m pip install "soundfile>=0.12.1"
   "$python_exe" -m pip install "$torchcodec_requirement"
+}
+
+install_requirements_without_torch() {
+  local python_exe="$1"
+  local requirements_path="$2"
+  local filtered_requirements
+  filtered_requirements="$(mktemp)"
+  grep -Ev '^(torch|torchaudio|torchvision|torchcodec)([=<>!~; ].*)?$' "$requirements_path" > "$filtered_requirements"
+  "$python_exe" -m pip install -r "$filtered_requirements"
+}
+
+install_applio_compatibility_fixes() {
+  local python_exe="$1"
+  "$python_exe" -m pip install "pillow<12.0,>=8.0"
+}
+
+install_applio_prerequisite_models() {
+  local python_exe="$1"
+  (
+    cd "$APPLIO_DIR"
+    "$python_exe" core.py prerequisites --pretraineds_hifigan False --models True --exe False
+  )
 }
 
 test_cuda_torch() {
@@ -100,8 +107,10 @@ install_cuda_torch "$APPLIO_DIR/env/bin/python"
 
 if [ -f "$APPLIO_DIR/requirements.txt" ]; then
   echo "Installing Applio requirements..."
-  "$APPLIO_DIR/env/bin/python" -m pip install -r "$APPLIO_DIR/requirements.txt"
+  install_requirements_without_torch "$APPLIO_DIR/env/bin/python" "$APPLIO_DIR/requirements.txt"
   install_cuda_torch "$APPLIO_DIR/env/bin/python"
+  install_applio_compatibility_fixes "$APPLIO_DIR/env/bin/python"
+  install_applio_prerequisite_models "$APPLIO_DIR/env/bin/python"
 fi
 
 test_cuda_torch "$APPLIO_DIR/env/bin/python" "Applio"

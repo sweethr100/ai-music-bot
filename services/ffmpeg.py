@@ -30,10 +30,7 @@ class FFmpegResolver:
         return self._cached_path
 
     def playback_options(self, normalizer_enabled: bool) -> str:
-        options = ["-vn", "-loglevel", "error"]
-        if normalizer_enabled:
-            options.extend(["-af", self.normalizer_filter])
-        return " ".join(options)
+        return "-vn -loglevel error"
 
     @staticmethod
     def reconnect_options() -> str:
