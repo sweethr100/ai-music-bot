@@ -296,49 +296,6 @@ class MusicCog(commands.Cog):
             or (voice_client and (voice_client.is_playing() or voice_client.is_paused()))
         )
 
-    async def _resolve_voice_channel_option(
-        self,
-        interaction: discord.Interaction,
-        connected_voice_channel: str | None,
-    ) -> discord.VoiceChannel | None:
-        if not connected_voice_channel:
-            return None
-
-        if not interaction.guild:
-            await self._send_followup_embed(
-                interaction,
-                "서버 전용 기능입니다",
-                "서버 안에서만 음성 채널을 선택할 수 있습니다.",
-                color=discord.Color.red(),
-                ephemeral=True,
-            )
-            return None
-
-        try:
-            channel_id = int(connected_voice_channel)
-        except ValueError:
-            await self._send_followup_embed(
-                interaction,
-                "음성 채널 선택 오류",
-                "선택한 음성 채널 값을 읽지 못했습니다.",
-                color=discord.Color.red(),
-                ephemeral=True,
-            )
-            return None
-
-        channel = interaction.guild.get_channel(channel_id)
-        if not isinstance(channel, discord.VoiceChannel):
-            await self._send_followup_embed(
-                interaction,
-                "음성 채널 선택 오류",
-                "선택한 음성 채널을 찾지 못했습니다.",
-                color=discord.Color.red(),
-                ephemeral=True,
-            )
-            return None
-
-        return channel
-
     async def _start_if_idle(self, guild_id: int) -> None:
         state = self.state_for(guild_id)
         if not state.is_playing:
@@ -536,7 +493,6 @@ class MusicCog(commands.Cog):
         vocal_pitch_shift="목소리 피치만 조절. -12부터 +12까지 정수로 입력",
         delivery="결과 파일을 채팅에 올릴지, 통화방에서 틀지도 함께 선택",
         voice_channel="명령어 사용자가 음성 채널에 없어도 재생할 음성 채널",
-        connected_voice_channel="현재 접속자가 있는 음성 채널 중에서 선택",
     )
     @app_commands.choices(mode=YOUTUBE_MODE_CHOICES, delivery=DELIVERY_CHOICES)
     async def play(
@@ -548,18 +504,13 @@ class MusicCog(commands.Cog):
         vocal_pitch_shift: app_commands.Range[int, -12, 12] = 0,
         delivery: str = "upload_and_play",
         voice_channel: discord.VoiceChannel | None = None,
-        connected_voice_channel: str | None = None,
     ):
         await interaction.response.defer()
         upload_file = delivery in {"upload_and_play", "upload_only"}
         play_in_voice = delivery in {"upload_and_play", "voice_only"}
 
         if play_in_voice:
-            selected_voice_channel = await self._resolve_voice_channel_option(interaction, connected_voice_channel)
-            if connected_voice_channel and not selected_voice_channel:
-                return
-            target_channel = selected_voice_channel or voice_channel
-            voice_client = await self._ensure_voice(interaction, target_channel)
+            voice_client = await self._ensure_voice(interaction, voice_channel)
             if not voice_client:
                 return
 
@@ -654,10 +605,6 @@ class MusicCog(commands.Cog):
     async def target_voice_autocomplete(self, interaction: discord.Interaction, current: str):
         return self._voice_autocomplete_choices(current, include_original=True)
 
-    @play.autocomplete("connected_voice_channel")
-    async def connected_voice_channel_autocomplete(self, interaction: discord.Interaction, current: str):
-        return self._connected_voice_channel_choices(interaction, current)
-
     @app_commands.command(name="play_file", description="업로드한 파일로 음악 재생, MR/보컬 분리, AI 커버를 처리합니다.")
     @app_commands.describe(
         file="재생하거나 처리할 오디오/동영상 파일",
@@ -666,7 +613,6 @@ class MusicCog(commands.Cog):
         vocal_pitch_shift="목소리 피치만 조절. -12부터 +12까지 정수로 입력",
         delivery="결과 파일을 채팅에 올릴지, 통화방에서 틀지도 함께 선택",
         voice_channel="명령어 사용자가 음성 채널에 없어도 재생할 음성 채널",
-        connected_voice_channel="현재 접속자가 있는 음성 채널 중에서 선택",
     )
     @app_commands.choices(mode=YOUTUBE_MODE_CHOICES, delivery=DELIVERY_CHOICES)
     async def play_file(
@@ -678,18 +624,13 @@ class MusicCog(commands.Cog):
         vocal_pitch_shift: app_commands.Range[int, -12, 12] = 0,
         delivery: str = "upload_and_play",
         voice_channel: discord.VoiceChannel | None = None,
-        connected_voice_channel: str | None = None,
     ):
         await interaction.response.defer()
         upload_file = delivery in {"upload_and_play", "upload_only"}
         play_in_voice = delivery in {"upload_and_play", "voice_only"}
 
         if play_in_voice:
-            selected_voice_channel = await self._resolve_voice_channel_option(interaction, connected_voice_channel)
-            if connected_voice_channel and not selected_voice_channel:
-                return
-            target_channel = selected_voice_channel or voice_channel
-            voice_client = await self._ensure_voice(interaction, target_channel)
+            voice_client = await self._ensure_voice(interaction, voice_channel)
             if not voice_client:
                 return
 
@@ -779,10 +720,6 @@ class MusicCog(commands.Cog):
     async def play_file_target_voice_autocomplete(self, interaction: discord.Interaction, current: str):
         return self._voice_autocomplete_choices(current, include_original=True)
 
-    @play_file.autocomplete("connected_voice_channel")
-    async def play_file_connected_voice_channel_autocomplete(self, interaction: discord.Interaction, current: str):
-        return self._connected_voice_channel_choices(interaction, current)
-
     @app_commands.command(name="play_duet", description="AI 듀엣 커버를 가수별 자동 분리로 만듭니다.")
     @app_commands.describe(
         query="유튜브 URL 또는 검색어",
@@ -791,7 +728,6 @@ class MusicCog(commands.Cog):
         vocal_pitch_shift="목소리 피치만 조절. -12부터 +12까지 정수로 입력",
         delivery="결과 파일을 채팅에 올릴지, 통화방에서 틀지도 함께 선택",
         voice_channel="명령어 사용자가 음성 채널에 없어도 재생할 음성 채널",
-        connected_voice_channel="현재 접속자가 있는 음성 채널 중에서 선택",
     )
     @app_commands.choices(delivery=DELIVERY_CHOICES)
     async def play_duet(
@@ -803,18 +739,13 @@ class MusicCog(commands.Cog):
         vocal_pitch_shift: app_commands.Range[int, -12, 12] = 0,
         delivery: str = "upload_and_play",
         voice_channel: discord.VoiceChannel | None = None,
-        connected_voice_channel: str | None = None,
     ):
         await interaction.response.defer()
         upload_file = delivery in {"upload_and_play", "upload_only"}
         play_in_voice = delivery in {"upload_and_play", "voice_only"}
 
         if play_in_voice:
-            selected_voice_channel = await self._resolve_voice_channel_option(interaction, connected_voice_channel)
-            if connected_voice_channel and not selected_voice_channel:
-                return
-            target_channel = selected_voice_channel or voice_channel
-            voice_client = await self._ensure_voice(interaction, target_channel)
+            voice_client = await self._ensure_voice(interaction, voice_channel)
             if not voice_client:
                 return
 
@@ -903,10 +834,6 @@ class MusicCog(commands.Cog):
     @play_duet.autocomplete("voice2")
     async def play_duet_voice2_autocomplete(self, interaction: discord.Interaction, current: str):
         return self._voice_autocomplete_choices(current, include_original=True)
-
-    @play_duet.autocomplete("connected_voice_channel")
-    async def play_duet_connected_voice_channel_autocomplete(self, interaction: discord.Interaction, current: str):
-        return self._connected_voice_channel_choices(interaction, current)
 
     @app_commands.command(name="playlist", description="유튜브 재생목록을 대기열에 추가합니다.")
     @app_commands.describe(url="유튜브 플레이리스트 URL", max_count="추가할 최대 곡 수")
@@ -1319,35 +1246,6 @@ class MusicCog(commands.Cog):
             if current_lower in name.lower()
         )
         return choices[:25]
-
-    @staticmethod
-    def _connected_voice_channel_choices(
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        if not interaction.guild:
-            return []
-
-        current_lower = current.lower()
-        choices: list[app_commands.Choice[str]] = []
-        for channel in interaction.guild.voice_channels:
-            if not channel.members:
-                continue
-
-            category_name = channel.category.name if channel.category else ""
-            searchable = f"{category_name} {channel.name}".lower()
-            if current_lower and current_lower not in searchable:
-                continue
-
-            member_count = len(channel.members)
-            label = f"{channel.name} ({member_count}명)"
-            if category_name:
-                label = f"{category_name} / {label}"
-            choices.append(app_commands.Choice(name=label[:100], value=str(channel.id)))
-            if len(choices) >= 25:
-                break
-
-        return choices
 
     @staticmethod
     def _mode_label(mode: str) -> str:

@@ -70,6 +70,37 @@ function Install-ApplioPrerequisiteModels {
     }
 }
 
+function Install-MultiSingerSeparator {
+    param([string]$PythonExe)
+
+    Write-Host "Installing AI duet multi-singer separator (Asteroid / MedleyVox support)..."
+    Invoke-Checked $PythonExe @(
+        "-m", "pip", "install",
+        "asteroid-filterbanks>=0.4.0",
+        "huggingface-hub",
+        "pandas",
+        "pytorch-lightning",
+        "torchmetrics==0.11.4",
+        "torch-optimizer==0.1.0",
+        "torch-stoi>=0.1.2",
+        "pytorch-ranger>=0.1.1",
+        "typer>=0.20.0,<0.26.0",
+        "httpx",
+        "mir-eval",
+        "pystoi"
+    )
+    Invoke-Checked $PythonExe @("-m", "pip", "install", "asteroid==0.7.0", "--no-deps")
+    Invoke-Checked $PythonExe @(
+        "-c",
+        "import asteroid; print('AI duet multi-singer separator OK:', asteroid.__version__)"
+    )
+    Write-Host "Downloading default AI duet multi-singer model (Cyru5/MedleyVox)..."
+    Invoke-Checked $PythonExe @(
+        "-c",
+        "from huggingface_hub import hf_hub_download; path = hf_hub_download(repo_id='Cyru5/MedleyVox', filename='vocals 100.pth'); print('Default AI duet model cached:', path)"
+    )
+}
+
 function Test-CudaTorch {
     param([string]$PythonExe, [string]$Label)
     Invoke-Checked $PythonExe @("-c", "import torch; assert torch.cuda.is_available(), 'CUDA is not available'; print('$Label CUDA OK:', torch.__version__, torch.cuda.get_device_name(0))")
@@ -91,6 +122,7 @@ Install-CudaTorch -PythonExe "python"
 Write-Host "Installing bot + AI music dependencies..."
 Invoke-Checked "python" @("-m", "pip", "install", "-r", (Join-Path $Root "requirements.txt"))
 Install-CudaTorch -PythonExe "python"
+Install-MultiSingerSeparator -PythonExe "python"
 Test-CudaTorch -PythonExe "python" -Label "Bot"
 
 if (-not (Test-Path $VendorDir)) {

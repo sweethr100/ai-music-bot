@@ -135,9 +135,9 @@ AI_COVER_INPUT_VOCAL_FILTER=none
 AI_COVER_OUTPUT_VOCAL_FILTER=none
 ```
 
-AI 듀엣은 `/play_duet`에서 `voice1`과 `voice2`를 고르면 실행됩니다. 두 옵션은 모두 필수이며, 원곡 가수를 그대로 둘 파트는 `원본 가수`를 선택합니다. 기본값은 추가 모델 설치 없이 내장 NMF 분리기를 사용합니다.
+AI 듀엣은 `/play_duet`에서 `voice1`과 `voice2`를 고르면 실행됩니다. 두 옵션은 모두 필수이며, 원곡 가수를 그대로 둘 파트는 `원본 가수`를 선택합니다. `scripts/install.ps1`은 기본 가수 분리 모델 실행에 필요한 Asteroid를 설치하고, `.env` 설정이 없으면 `Cyru5/MedleyVox`를 자동으로 사용합니다.
 
-별도 multi-singer 모델을 쓰고 싶을 때만 아래 값을 `.env`에 넣습니다. Hugging Face/Asteroid 모델은 `asteroid`를 따로 설치해야 하며, Windows에서는 `pesq` 빌드를 위해 Microsoft C++ Build Tools가 필요할 수 있습니다.
+Windows에서 `asteroid` 설치 중 `pesq` 빌드 오류가 나면 Microsoft C++ Build Tools를 설치한 뒤 `scripts/install.ps1`을 다시 실행합니다. 기본값 대신 다른 multi-singer 모델을 쓰고 싶을 때만 아래 값을 `.env`에 넣습니다.
 
 ```env
 MULTI_SINGER_SEPARATOR_BACKEND=asteroid

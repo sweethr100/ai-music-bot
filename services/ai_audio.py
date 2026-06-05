@@ -24,7 +24,8 @@ class OptionalFeatureMissing(RuntimeError):
 
 
 DEFAULT_SEPARATOR_MODEL = "mel_band_roformer_kim_ft_unwa.ckpt"
-DEFAULT_MULTI_SINGER_SEPARATOR_MODEL = ""
+DEFAULT_MULTI_SINGER_SEPARATOR_MODEL = "Cyru5/MedleyVox"
+DEFAULT_MULTI_SINGER_SEPARATOR_FILE = "vocals 100.pth"
 ORIGINAL_SINGER_NAME = "원본 가수"
 ORIGINAL_SINGER_VALUE = "__original_singer__"
 
@@ -716,23 +717,35 @@ class AIProcessor:
         configured_model = os.getenv("MULTI_SINGER_SEPARATOR_MODEL", "").strip()
         model_name = configured_model or DEFAULT_MULTI_SINGER_SEPARATOR_MODEL
         command_template = os.getenv("MULTI_SINGER_SEPARATOR_COMMAND", "").strip()
+        attempted_dedicated_separator = False
+        last_separator_error: Exception | None = None
 
         if backend in {"asteroid", "medleyvox", "huggingface", "hf"} or (
             backend == "auto" and self._looks_like_huggingface_model(model_name)
         ):
+            attempted_dedicated_separator = True
             await progress(f"가수 개별 보컬 분리 모델을 자동 실행하는 중... ({model_name})")
             try:
-                return await self._separate_duet_with_asteroid(vocals, work_dir, model_name)
+                stems = await self._separate_duet_with_asteroid(vocals, work_dir, model_name)
+                if self._duet_stems_are_imbalanced(stems):
+                    if backend != "auto":
+                        raise RuntimeError("가수 분리 모델 결과가 한쪽 stem으로 너무 몰렸습니다.")
+                    await progress("가수 분리 모델 결과가 한쪽으로 몰려 내장 자동 듀엣 분리기로 다시 시도하는 중...")
+                    return await self._separate_duet_with_builtin_nmf(vocals, work_dir)
+                return stems
             except Exception as exc:
+                last_separator_error = exc
                 if backend != "auto":
                     raise RuntimeError(f"가수 개별 보컬 분리가 실패했습니다.\n{str(exc)[-1200:]}") from exc
                 print(f"Asteroid multi-singer separator failed, trying other backends: {exc}")
 
         if backend in {"auto", "audio-separator", "audio_separator"} and configured_model:
+            attempted_dedicated_separator = True
             await progress(f"가수 개별 보컬 분리 모델을 실행하는 중... ({model_name})")
             try:
                 return await self._separate_duet_with_audio_separator(vocals, work_dir, model_name)
             except Exception as exc:
+                last_separator_error = exc
                 if backend != "auto":
                     raise RuntimeError(f"가수 개별 보컬 분리가 실패했습니다.\n{str(exc)[-1200:]}") from exc
                 print(f"Multi-singer audio-separator failed, trying command backend: {exc}")
@@ -743,10 +756,12 @@ class AIProcessor:
             )
 
         if backend in {"auto", "command", "external"} and command_template:
+            attempted_dedicated_separator = True
             await progress("외부 가수 개별 보컬 분리 모델을 실행하는 중...")
             try:
                 return await self._separate_duet_with_command(vocals, work_dir, command_template)
             except Exception as exc:
+                last_separator_error = exc
                 if backend != "auto":
                     raise RuntimeError(f"외부 가수 개별 보컬 분리가 실패했습니다.\n{str(exc)[-1200:]}") from exc
                 print(f"Multi-singer command backend failed: {exc}")
@@ -758,7 +773,13 @@ class AIProcessor:
                 "`MULTI_SINGER_SEPARATOR_COMMAND`로 외부 분리 명령을 지정해 주세요."
             )
 
-        await progress("전용 가수 분리 모델 설정이 없어 내장 자동 듀엣 분리기를 실행하는 중...")
+        if attempted_dedicated_separator and last_separator_error:
+            await progress(
+                "전용 가수 분리 모델 실행이 실패해 내장 자동 듀엣 분리기로 전환하는 중...\n"
+                f"{str(last_separator_error)[-500:]}"
+            )
+        else:
+            await progress("전용 가수 분리 모델 설정이 없어 내장 자동 듀엣 분리기를 실행하는 중...")
         return await self._separate_duet_with_builtin_nmf(vocals, work_dir)
 
     async def _separate_duet_with_audio_separator(
@@ -801,11 +822,12 @@ class AIProcessor:
     ) -> DuetSingerStems:
         output_dir = work_dir / "multi_singer_asteroid"
         output_dir.mkdir(parents=True, exist_ok=True)
+        model_input = work_dir / "multi_singer_input_mono.wav"
+        await self._prepare_multi_singer_input(vocals, model_input)
 
         def separate() -> DuetSingerStems:
             try:
                 import torch
-                from asteroid.models import BaseModel
             except ImportError as exc:
                 raise OptionalFeatureMissing(
                     "AI 듀엣 가수별 분리 모델 실행에 필요한 `asteroid`가 설치되어 있지 않습니다. "
@@ -816,15 +838,102 @@ class AIProcessor:
             if not device:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-            model = BaseModel.from_pretrained(model_name)
+            model = self._load_asteroid_separator_model(model_name)
             model.to(device)
             model.eval()
             with torch.inference_mode():
-                model.separate(str(vocals), output_dir=str(output_dir), force_overwrite=True)
+                model.separate(str(model_input), output_dir=str(output_dir), force_overwrite=True)
 
             return self._pick_duet_singer_outputs(list(output_dir.glob("**/*.wav")))
 
         return await asyncio.to_thread(separate)
+
+    async def _prepare_multi_singer_input(self, source: Path, output: Path) -> None:
+        cmd = [
+            self.ffmpeg.executable(),
+            "-y",
+            "-i",
+            str(source),
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            "-c:a",
+            "pcm_s16le",
+            str(output),
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(stderr.decode("utf-8", errors="ignore")[-1000:])
+
+    @staticmethod
+    def _load_asteroid_separator_model(model_name: str):
+        if model_name == DEFAULT_MULTI_SINGER_SEPARATOR_MODEL:
+            return AIProcessor._load_medleyvox_model()
+
+        try:
+            from asteroid.models import BaseModel
+        except ImportError as exc:
+            raise OptionalFeatureMissing(
+                "AI 듀엣 가수별 분리 모델 실행에 필요한 `asteroid`가 설치되어 있지 않습니다. "
+                "`scripts/install.ps1` 또는 `scripts/install.sh`를 다시 실행해 주세요."
+            ) from exc
+
+        return BaseModel.from_pretrained(model_name)
+
+    @staticmethod
+    def _load_medleyvox_model():
+        try:
+            import torch
+            from asteroid.models import ConvTasNet
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:
+            raise OptionalFeatureMissing(
+                "AI 듀엣 MedleyVox 모델 실행에 필요한 패키지가 설치되어 있지 않습니다. "
+                "`scripts/install.ps1` 또는 `scripts/install.sh`를 다시 실행해 주세요."
+            ) from exc
+
+        model_file = os.getenv("MULTI_SINGER_SEPARATOR_FILE", DEFAULT_MULTI_SINGER_SEPARATOR_FILE).strip()
+        checkpoint_path = hf_hub_download(
+            repo_id=DEFAULT_MULTI_SINGER_SEPARATOR_MODEL,
+            filename=model_file,
+        )
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        prefix = "ema_model.module."
+        if not any(key.startswith(prefix) for key in checkpoint):
+            prefix = "online_model.module."
+
+        state_dict = {
+            key.removeprefix(prefix): value
+            for key, value in checkpoint.items()
+            if key.startswith(prefix)
+        }
+        if not state_dict:
+            raise RuntimeError(f"MedleyVox 체크포인트에서 모델 가중치를 찾지 못했습니다: {model_file}")
+
+        model = ConvTasNet(
+            n_src=2,
+            in_chan=2050,
+            out_chan=2050,
+            n_blocks=8,
+            n_repeats=3,
+            bn_chan=256,
+            hid_chan=1024,
+            skip_chan=256,
+            conv_kernel_size=3,
+            fb_name="stft",
+            kernel_size=2048,
+            stride=512,
+            n_filters=2048,
+            sample_rate=44100,
+        )
+        model.load_state_dict(state_dict)
+        return model
 
     async def _separate_duet_with_command(
         self,
@@ -931,7 +1040,7 @@ class AIProcessor:
     def _pick_duet_singer_outputs(paths: list[Path]) -> DuetSingerStems:
         existing = sorted(
             [path for path in paths if path.exists() and path.stat().st_size > 44],
-            key=lambda path: path.stat().st_size,
+            key=lambda path: AIProcessor._audio_rms(path),
             reverse=True,
         )
         singer_like: list[Path] = []
@@ -958,6 +1067,35 @@ class AIProcessor:
                 "결과 폴더에 두 가수 stem WAV가 생성되도록 모델/명령을 확인해 주세요."
             )
         return DuetSingerStems(first=candidates[0], second=candidates[1])
+
+    @staticmethod
+    def _duet_stems_are_imbalanced(stems: DuetSingerStems) -> bool:
+        first_rms = AIProcessor._audio_rms(stems.first)
+        second_rms = AIProcessor._audio_rms(stems.second)
+        stronger = max(first_rms, second_rms)
+        weaker = min(first_rms, second_rms)
+        if stronger <= 1e-6:
+            return True
+
+        min_ratio = float(os.getenv("MULTI_SINGER_SEPARATOR_MIN_RMS_RATIO", "0.08"))
+        return weaker / stronger < min_ratio
+
+    @staticmethod
+    def _audio_rms(path: Path) -> float:
+        try:
+            import numpy as np
+            import soundfile as sf
+
+            audio, _ = sf.read(path, always_2d=False)
+            if audio.size == 0:
+                return 0.0
+            data = np.asarray(audio, dtype=np.float32)
+            return float(np.sqrt(np.mean(np.square(data))))
+        except Exception:
+            try:
+                return float(path.stat().st_size)
+            except OSError:
+                return 0.0
 
     async def _separate_vocals(self, input_wav: Path, work_dir: Path, progress) -> tuple[Path, Path]:
         backend = os.getenv("VOCAL_SEPARATOR_BACKEND", "auto").strip().lower()
