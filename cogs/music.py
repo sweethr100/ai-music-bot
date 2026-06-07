@@ -835,6 +835,66 @@ class MusicCog(commands.Cog):
     async def play_duet_voice2_autocomplete(self, interaction: discord.Interaction, current: str):
         return self._voice_autocomplete_choices(current, include_original=True)
 
+    @app_commands.command(name="separate_singers", description="유튜브 곡을 가수별 보컬 stem MP3로 분리해 올립니다.")
+    @app_commands.describe(query="유튜브 URL 또는 검색어")
+    async def separate_singers(self, interaction: discord.Interaction, query: str):
+        await interaction.response.defer()
+        try:
+            status = await self._send_followup_embed(
+                interaction,
+                "가수별 보컬 분리 준비 중",
+                "곡을 받아서 보컬을 가수별 stem으로 나눌 준비를 하고 있습니다.",
+            )
+
+            async def progress(text: str) -> None:
+                try:
+                    await self._edit_processing_status(status, "가수별 보컬 분리", text)
+                except discord.HTTPException:
+                    pass
+
+            stems = await self.bot.ai_processor.separate_youtube_singers(query, progress)
+            uploaded_count = 0
+            for index, stem in enumerate(stems, start=1):
+                track = TrackInfo(
+                    title=f"[가수분리 {index}] {stem.title}",
+                    webpage_url=stem.webpage_url,
+                    duration=stem.duration,
+                    thumbnail=stem.thumbnail,
+                )
+                song = Song(
+                    track,
+                    interaction.user.id,
+                    interaction.user.display_name,
+                    local_path=stem.path,
+                    mode="vocal",
+                )
+                if await self._send_song_file(interaction, song):
+                    uploaded_count += 1
+                self._cleanup_song(song)
+
+            await self._edit_message_embed(
+                status,
+                "가수별 보컬 분리 완료",
+                f"가수별 stem **{uploaded_count}/{len(stems)}개**를 업로드했습니다.",
+                color=discord.Color.green(),
+            )
+        except OptionalFeatureMissing as exc:
+            await self._send_followup_embed(
+                interaction,
+                "기능을 사용할 수 없습니다",
+                str(exc),
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await self._send_followup_embed(
+                interaction,
+                "처리 중 오류가 발생했습니다",
+                f"```{str(exc)[:1500]}```",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
+
     @app_commands.command(name="playlist", description="유튜브 재생목록을 대기열에 추가합니다.")
     @app_commands.describe(url="유튜브 플레이리스트 URL", max_count="추가할 최대 곡 수")
     async def playlist(
@@ -1057,12 +1117,18 @@ class MusicCog(commands.Cog):
             )
             return
 
-        result = await self.bot.lyrics.search(search_query)
+        current_artist = state.current.track.artist if state.current and not query else None
+        current_duration = state.current.track.duration if state.current and not query else None
+        result = await self.bot.lyrics.search(
+            search_query,
+            artist=current_artist,
+            duration=current_duration,
+        )
         if not result:
             await self._send_followup_embed(
                 interaction,
                 "가사를 찾지 못했습니다",
-                "검색 결과에서 가사를 찾지 못했습니다.",
+                "검색 결과가 없거나 가사 검색 서버가 제때 응답하지 않았습니다. 잠시 후 다시 시도해 주세요.",
                 color=discord.Color.red(),
                 ephemeral=True,
             )

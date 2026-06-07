@@ -67,6 +67,13 @@ class DuetSingerStems:
     second: Path
 
 
+@dataclass(frozen=True)
+class DiarizedSegment:
+    start: float
+    end: float
+    speaker: str
+
+
 class RVCEngine:
     def __init__(self, voice_root: Path | str = "voice_models"):
         self.voice_root = Path(voice_root)
@@ -500,6 +507,40 @@ class AIProcessor:
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
+    async def separate_youtube_singers(self, url: str, progress) -> list[ProcessedAudio]:
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix="ai_music_singers_", dir=str(self.temp_dir)))
+        try:
+            await progress("유튜브 오디오를 다운로드하는 중...")
+            input_wav, title, duration, webpage_url, thumbnail = await self._download_audio(url, work_dir)
+
+            await progress("보컬과 반주를 분리하는 중...")
+            vocals, _ = await self._separate_vocals(input_wav, work_dir, progress)
+            vocals = await self._prepare_vocals_for_conversion(vocals, work_dir, progress)
+
+            await progress("가수별 보컬 stem을 분리하는 중...")
+            stems = await self._separate_duet_singers(vocals, work_dir, progress)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_title = self._safe_name(title)
+            outputs: list[ProcessedAudio] = []
+            for index, stem in enumerate((stems.first, stems.second), start=1):
+                output = self.output_dir / f"SINGER_{index}_{safe_title}_{timestamp}.mp3"
+                await progress(f"{index}번 가수 stem을 MP3로 내보내는 중...")
+                await self._export_audio(stem, output)
+                outputs.append(
+                    ProcessedAudio(
+                        path=str(output),
+                        title=f"{title} - singer{index}",
+                        duration=duration,
+                        webpage_url=webpage_url,
+                        thumbnail=thumbnail,
+                    )
+                )
+            return outputs
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
     async def _process_prepared_audio(
         self,
         input_wav: Path,
@@ -713,25 +754,42 @@ class AIProcessor:
         return int(hours * 3600 + minutes * 60 + seconds)
 
     async def _separate_duet_singers(self, vocals: Path, work_dir: Path, progress) -> DuetSingerStems:
-        backend = os.getenv("MULTI_SINGER_SEPARATOR_BACKEND", "auto").strip().lower()
+        backend = os.getenv("MULTI_SINGER_SEPARATOR_BACKEND", "pyannote").strip().lower() or "pyannote"
         configured_model = os.getenv("MULTI_SINGER_SEPARATOR_MODEL", "").strip()
         model_name = configured_model or DEFAULT_MULTI_SINGER_SEPARATOR_MODEL
         command_template = os.getenv("MULTI_SINGER_SEPARATOR_COMMAND", "").strip()
         attempted_dedicated_separator = False
         last_separator_error: Exception | None = None
 
+        if backend in {"local", "local_diarization", "local-diarization", "diarization", "no-login", "nologin"}:
+            await progress("로그인 없는 로컬 보컬 시간표 분리기를 실행하는 중...")
+            try:
+                return await self._separate_duet_with_local_diarization(vocals, work_dir, progress)
+            except Exception as exc:
+                if self._env_enabled("MULTI_SINGER_SEPARATOR_REQUIRE_MODEL"):
+                    raise RuntimeError(f"로컬 듀엣 파트 분석이 실패했습니다.\n{str(exc)[-1200:]}") from exc
+                raise RuntimeError(f"로컬 듀엣 파트 분석이 실패했습니다.\n{str(exc)[-1200:]}") from exc
+
+        if backend in {"pyannote", "speaker-diarization", "speaker_diarization"}:
+            attempted_dedicated_separator = True
+            await progress("PyAnnote Audio로 보컬 파트 시간표를 분석하는 중...")
+            try:
+                return await self._separate_duet_with_pyannote_diarization(vocals, work_dir, progress)
+            except Exception as exc:
+                raise RuntimeError(f"PyAnnote Audio 듀엣 파트 분석이 실패했습니다.\n{str(exc)[-1200:]}") from exc
+
         if backend in {"asteroid", "medleyvox", "huggingface", "hf"} or (
-            backend == "auto" and self._looks_like_huggingface_model(model_name)
+            backend == "auto" and configured_model and self._looks_like_huggingface_model(model_name)
         ):
             attempted_dedicated_separator = True
             await progress(f"가수 개별 보컬 분리 모델을 자동 실행하는 중... ({model_name})")
             try:
                 stems = await self._separate_duet_with_asteroid(vocals, work_dir, model_name)
-                if self._duet_stems_are_imbalanced(stems):
+                if self._duet_stems_are_low_quality(stems):
                     if backend != "auto":
-                        raise RuntimeError("가수 분리 모델 결과가 한쪽 stem으로 너무 몰렸습니다.")
-                    await progress("가수 분리 모델 결과가 한쪽으로 몰려 내장 자동 듀엣 분리기로 다시 시도하는 중...")
-                    return await self._separate_duet_with_builtin_nmf(vocals, work_dir)
+                        raise RuntimeError("가수 분리 모델 결과가 한쪽으로 몰렸거나 두 stem이 너무 비슷합니다.")
+                    await progress("가수 분리 모델 결과가 충분히 갈라지지 않아 로컬 시간표 분리기로 다시 시도하는 중...")
+                    return await self._separate_duet_with_local_diarization(vocals, work_dir, progress)
                 return stems
             except Exception as exc:
                 last_separator_error = exc
@@ -775,12 +833,330 @@ class AIProcessor:
 
         if attempted_dedicated_separator and last_separator_error:
             await progress(
-                "전용 가수 분리 모델 실행이 실패해 내장 자동 듀엣 분리기로 전환하는 중...\n"
+                "전용 가수 분리 모델 실행이 실패해 로컬 시간표 분리기로 전환하는 중...\n"
                 f"{str(last_separator_error)[-500:]}"
             )
         else:
-            await progress("전용 가수 분리 모델 설정이 없어 내장 자동 듀엣 분리기를 실행하는 중...")
-        return await self._separate_duet_with_builtin_nmf(vocals, work_dir)
+            await progress("전용 가수 분리 모델 설정이 없어 로컬 시간표 분리기를 실행하는 중...")
+        return await self._separate_duet_with_local_diarization(vocals, work_dir, progress)
+
+    async def _separate_duet_with_local_diarization(
+        self,
+        vocals: Path,
+        work_dir: Path,
+        progress,
+    ) -> DuetSingerStems:
+        output_dir = work_dir / "multi_singer_local_diarization"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        def diarize_and_cut() -> DuetSingerStems:
+            try:
+                import librosa
+                import numpy as np
+                import soundfile as sf
+                from sklearn.cluster import KMeans
+                from sklearn.preprocessing import StandardScaler
+            except ImportError as exc:
+                raise OptionalFeatureMissing(
+                    "로컬 듀엣 시간표 분리에 필요한 `librosa`와 `scikit-learn`이 설치되어 있지 않습니다. "
+                    "`scripts/install.ps1` 또는 `scripts/install.sh`를 다시 실행해 주세요."
+                ) from exc
+
+            y, sample_rate = librosa.load(vocals, sr=24000, mono=True)
+            if y.size == 0:
+                raise RuntimeError("듀엣 분리에 사용할 보컬 오디오가 비어 있습니다.")
+
+            n_fft = 2048
+            hop_length = 512
+            rms = librosa.feature.rms(y=y, frame_length=n_fft, hop_length=hop_length)[0]
+            if rms.size < 8 or float(np.max(rms)) <= 1e-6:
+                raise RuntimeError("로컬 시간표 분리에 사용할 충분한 보컬 에너지를 찾지 못했습니다.")
+
+            active_floor = float(os.getenv("LOCAL_DIARIZATION_ACTIVE_FLOOR", "0.018"))
+            percentile_gate = float(os.getenv("LOCAL_DIARIZATION_PERCENTILE_GATE", "35"))
+            energy_threshold = max(
+                float(np.max(rms)) * active_floor,
+                float(np.percentile(rms, percentile_gate)) * 0.55,
+                1e-6,
+            )
+            active = rms >= energy_threshold
+            active_indices = np.flatnonzero(active)
+            if active_indices.size < 12:
+                raise RuntimeError("로컬 시간표 분리에 사용할 활성 보컬 프레임이 너무 적습니다.")
+
+            mfcc = librosa.feature.mfcc(y=y, sr=sample_rate, n_mfcc=13, n_fft=n_fft, hop_length=hop_length)
+            delta = librosa.feature.delta(mfcc)
+            centroid = librosa.feature.spectral_centroid(y=y, sr=sample_rate, n_fft=n_fft, hop_length=hop_length)
+            bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sample_rate, n_fft=n_fft, hop_length=hop_length)
+            contrast = librosa.feature.spectral_contrast(y=y, sr=sample_rate, n_fft=n_fft, hop_length=hop_length)
+            features = np.vstack(
+                [
+                    mfcc[1:13],
+                    delta[1:13],
+                    centroid,
+                    bandwidth,
+                    contrast,
+                ]
+            ).T
+
+            frame_count = min(features.shape[0], rms.size)
+            features = features[:frame_count]
+            rms = rms[:frame_count]
+            active = active[:frame_count]
+            active_indices = np.flatnonzero(active)
+            if active_indices.size < 12:
+                raise RuntimeError("로컬 시간표 분리에 사용할 활성 보컬 프레임이 너무 적습니다.")
+
+            active_features = features[active_indices]
+            scaler = StandardScaler()
+            active_features = scaler.fit_transform(active_features)
+
+            model = KMeans(n_clusters=2, n_init=20, random_state=0)
+            weights = np.maximum(rms[active_indices], 1e-6)
+            labels = model.fit_predict(active_features, sample_weight=weights)
+
+            frame_labels = np.full(frame_count, -1, dtype=np.int16)
+            frame_labels[active_indices] = labels
+            frame_labels = self._smooth_frame_labels(
+                frame_labels,
+                window_frames=max(3, int(round(float(os.getenv("LOCAL_DIARIZATION_SMOOTH_SECONDS", "0.45")) * sample_rate / hop_length))),
+            )
+
+            min_segment_seconds = float(os.getenv("LOCAL_DIARIZATION_MIN_SEGMENT_SECONDS", "0.35"))
+            merge_gap_seconds = float(os.getenv("LOCAL_DIARIZATION_MERGE_GAP_SECONDS", "0.45"))
+            segments = self._segments_from_frame_labels(
+                frame_labels,
+                sample_rate=sample_rate,
+                hop_length=hop_length,
+                min_segment_seconds=min_segment_seconds,
+                merge_gap_seconds=merge_gap_seconds,
+            )
+            if not segments:
+                raise RuntimeError("로컬 시간표 분리기가 두 보컬 구간을 만들지 못했습니다.")
+
+            speaker_stats: dict[str, dict[str, float]] = {}
+            for segment in segments:
+                duration = segment.end - segment.start
+                stats = speaker_stats.setdefault(
+                    segment.speaker,
+                    {"duration": 0.0, "first_start": segment.start},
+                )
+                stats["duration"] += duration
+                stats["first_start"] = min(stats["first_start"], segment.start)
+            if len(speaker_stats) < 2:
+                raise RuntimeError("로컬 시간표 분리기가 두 명의 보컬 파트를 충분히 구분하지 못했습니다.")
+
+            chosen_speakers = sorted(
+                speaker_stats,
+                key=lambda speaker: speaker_stats[speaker]["duration"],
+                reverse=True,
+            )[:2]
+            chosen_speakers.sort(key=lambda speaker: speaker_stats[speaker]["first_start"])
+            speaker_to_index = {speaker: index for index, speaker in enumerate(chosen_speakers)}
+
+            masks = [np.zeros(len(y), dtype=np.float32), np.zeros(len(y), dtype=np.float32)]
+            padding_seconds = float(os.getenv("LOCAL_DIARIZATION_SEGMENT_PADDING_SECONDS", "0.08"))
+            fade_seconds = float(os.getenv("LOCAL_DIARIZATION_SEGMENT_FADE_SECONDS", "0.025"))
+            fade_samples = max(1, int(fade_seconds * sample_rate))
+
+            for segment in segments:
+                index = speaker_to_index.get(segment.speaker)
+                if index is None:
+                    continue
+                start = max(0, int(round((segment.start - padding_seconds) * sample_rate)))
+                end = min(len(y), int(round((segment.end + padding_seconds) * sample_rate)))
+                self._apply_segment_mask(masks[index], start, end, fade_samples)
+
+            active_mask = masks[0] + masks[1]
+            overlap = active_mask > 1.0
+            if np.any(overlap):
+                masks[0][overlap] /= active_mask[overlap]
+                masks[1][overlap] /= active_mask[overlap]
+
+            outputs: list[tuple[float, Path]] = []
+            for index, mask in enumerate(masks, start=1):
+                stem = y * mask
+                output = output_dir / f"singer{index}.wav"
+                sf.write(output, stem, sample_rate)
+                rms_value = float(np.sqrt(np.mean(np.square(stem)))) if stem.size else 0.0
+                outputs.append((rms_value, output))
+
+            if not all(rms_value > 1e-5 for rms_value, _ in outputs):
+                raise RuntimeError("로컬 시간표로 만든 stem 중 하나가 거의 비어 있습니다.")
+
+            report = output_dir / "local_diarization_segments.txt"
+            with report.open("w", encoding="utf-8") as file:
+                for segment in sorted(segments, key=lambda item: item.start):
+                    mapped = speaker_to_index.get(segment.speaker)
+                    if mapped is None:
+                        continue
+                    file.write(
+                        f"{self._format_seconds(segment.start)} - "
+                        f"{self._format_seconds(segment.end)}: "
+                        f"singer{mapped + 1} ({segment.speaker})\n"
+                    )
+
+            return DuetSingerStems(first=outputs[0][1], second=outputs[1][1])
+
+        stems = await asyncio.to_thread(diarize_and_cut)
+        await progress("로컬 시간표대로 1번/2번 보컬 파트를 잘라냈습니다.")
+        return stems
+
+    async def _separate_duet_with_pyannote_diarization(
+        self,
+        vocals: Path,
+        work_dir: Path,
+        progress,
+    ) -> DuetSingerStems:
+        output_dir = work_dir / "multi_singer_pyannote"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        def diarize_and_cut() -> DuetSingerStems:
+            try:
+                import librosa
+                import numpy as np
+                import soundfile as sf
+                import torch
+                from pyannote.audio import Pipeline
+            except ImportError as exc:
+                raise OptionalFeatureMissing(
+                    "PyAnnote Audio 듀엣 파트 분석에 필요한 `pyannote.audio`가 설치되어 있지 않습니다. "
+                    "`scripts/install.ps1`을 다시 실행하거나 `python -m pip install -r requirements.txt`를 "
+                    "실행해 주세요."
+                ) from exc
+
+            model_name = os.getenv(
+                "PYANNOTE_DIARIZATION_MODEL",
+                "pyannote/speaker-diarization-community-1",
+            ).strip()
+            explicit_token = (
+                os.getenv("PYANNOTE_AUTH_TOKEN", "").strip()
+                or os.getenv("HF_TOKEN", "").strip()
+                or os.getenv("HUGGINGFACE_TOKEN", "").strip()
+                or None
+            )
+            token = explicit_token or True
+
+            kwargs = {"token": token}
+            try:
+                try:
+                    pipeline = Pipeline.from_pretrained(model_name, **kwargs)
+                except Exception as exc:
+                    raise AIProcessor._pyannote_load_error(model_name, exc) from exc
+            except TypeError:
+                kwargs = {"use_auth_token": token}
+                try:
+                    pipeline = Pipeline.from_pretrained(model_name, **kwargs)
+                except Exception as exc:
+                    raise AIProcessor._pyannote_load_error(model_name, exc) from exc
+            if pipeline is None:
+                raise OptionalFeatureMissing(
+                    "PyAnnote Audio 모델을 불러오지 못했습니다. Hugging Face 모델 사용 조건 동의와 "
+                    "HF_TOKEN/PYANNOTE_AUTH_TOKEN 또는 `huggingface-cli login` 상태를 확인해 주세요."
+                )
+
+            device = os.getenv("PYANNOTE_DEVICE", "").strip()
+            if not device:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            if hasattr(pipeline, "to"):
+                pipeline.to(torch.device(device))
+
+            y, sample_rate = librosa.load(vocals, sr=None, mono=True)
+            if y.size == 0:
+                raise RuntimeError("듀엣 분리에 사용할 보컬 오디오가 비어 있습니다.")
+
+            waveform = torch.from_numpy(np.asarray(y, dtype=np.float32)).unsqueeze(0)
+            result = pipeline(
+                {"waveform": waveform, "sample_rate": sample_rate},
+                num_speakers=2,
+            )
+            annotation = getattr(result, "speaker_diarization", result)
+            if not hasattr(annotation, "itertracks"):
+                raise RuntimeError("PyAnnote Audio 결과에서 speaker diarization timeline을 찾지 못했습니다.")
+
+            segments: list[DiarizedSegment] = []
+            for segment, _, speaker in annotation.itertracks(yield_label=True):
+                start = max(0.0, float(segment.start))
+                end = max(start, float(segment.end))
+                if end > start:
+                    segments.append(DiarizedSegment(start=start, end=end, speaker=str(speaker)))
+
+            if not segments:
+                raise RuntimeError("PyAnnote Audio가 보컬 구간을 찾지 못했습니다.")
+
+            speaker_stats: dict[str, dict[str, float]] = {}
+            min_segment_seconds = float(os.getenv("PYANNOTE_MIN_SEGMENT_SECONDS", "0.25"))
+            for segment in segments:
+                duration = segment.end - segment.start
+                if duration < min_segment_seconds:
+                    continue
+                stats = speaker_stats.setdefault(
+                    segment.speaker,
+                    {"duration": 0.0, "first_start": segment.start},
+                )
+                stats["duration"] += duration
+                stats["first_start"] = min(stats["first_start"], segment.start)
+
+            if len(speaker_stats) < 2:
+                raise RuntimeError("PyAnnote Audio가 두 명의 보컬 파트를 충분히 구분하지 못했습니다.")
+
+            chosen_speakers = sorted(
+                speaker_stats,
+                key=lambda speaker: speaker_stats[speaker]["duration"],
+                reverse=True,
+            )[:2]
+            chosen_speakers.sort(key=lambda speaker: speaker_stats[speaker]["first_start"])
+            speaker_to_index = {speaker: index for index, speaker in enumerate(chosen_speakers)}
+
+            masks = [np.zeros(len(y), dtype=np.float32), np.zeros(len(y), dtype=np.float32)]
+            padding_seconds = float(os.getenv("PYANNOTE_SEGMENT_PADDING_SECONDS", "0.08"))
+            fade_seconds = float(os.getenv("PYANNOTE_SEGMENT_FADE_SECONDS", "0.025"))
+            fade_samples = max(1, int(fade_seconds * sample_rate))
+
+            for segment in segments:
+                index = speaker_to_index.get(segment.speaker)
+                if index is None or segment.end - segment.start < min_segment_seconds:
+                    continue
+                start = max(0, int(round((segment.start - padding_seconds) * sample_rate)))
+                end = min(len(y), int(round((segment.end + padding_seconds) * sample_rate)))
+                if end <= start:
+                    continue
+                self._apply_segment_mask(masks[index], start, end, fade_samples)
+
+            active = masks[0] + masks[1]
+            overlap = active > 1.0
+            if np.any(overlap):
+                masks[0][overlap] /= active[overlap]
+                masks[1][overlap] /= active[overlap]
+
+            outputs: list[tuple[float, Path]] = []
+            for index, mask in enumerate(masks, start=1):
+                stem = y * mask
+                output = output_dir / f"singer{index}.wav"
+                sf.write(output, stem, sample_rate)
+                rms = float(np.sqrt(np.mean(np.square(stem)))) if stem.size else 0.0
+                outputs.append((rms, output))
+
+            if not all(rms > 1e-5 for rms, _ in outputs):
+                raise RuntimeError("PyAnnote Audio 시간표로 만든 stem 중 하나가 거의 비어 있습니다.")
+
+            report = output_dir / "diarization_segments.txt"
+            with report.open("w", encoding="utf-8") as file:
+                for segment in sorted(segments, key=lambda item: item.start):
+                    mapped = speaker_to_index.get(segment.speaker)
+                    if mapped is None:
+                        continue
+                    file.write(
+                        f"{self._format_seconds(segment.start)} - "
+                        f"{self._format_seconds(segment.end)}: "
+                        f"singer{mapped + 1} ({segment.speaker})\n"
+                    )
+
+            return DuetSingerStems(first=outputs[0][1], second=outputs[1][1])
+
+        stems = await asyncio.to_thread(diarize_and_cut)
+        await progress("PyAnnote Audio 시간표대로 1번/2번 보컬 파트를 잘라냈습니다.")
+        return stems
 
     async def _separate_duet_with_audio_separator(
         self,
@@ -963,64 +1339,107 @@ class AIProcessor:
 
         return self._pick_duet_singer_outputs(list(output_dir.glob("**/*.wav")))
 
-    async def _separate_duet_with_builtin_nmf(self, vocals: Path, work_dir: Path) -> DuetSingerStems:
-        output_dir = work_dir / "multi_singer_builtin"
-        output_dir.mkdir(parents=True, exist_ok=True)
+    @staticmethod
+    def _smooth_frame_labels(frame_labels, window_frames: int):
+        import numpy as np
 
-        def separate() -> DuetSingerStems:
-            try:
-                import librosa
-                import numpy as np
-                import soundfile as sf
-                from sklearn.decomposition import NMF
-            except ImportError as exc:
-                raise OptionalFeatureMissing(
-                    "내장 AI 듀엣 자동 분리기에 필요한 `librosa`와 `scikit-learn`이 설치되어 있지 않습니다. "
-                    "`scripts/install.ps1` 또는 `scripts/install.sh`를 다시 실행해 주세요."
-                ) from exc
+        labels = np.asarray(frame_labels).copy()
+        if labels.size == 0:
+            return labels
 
-            y, sample_rate = librosa.load(vocals, sr=24000, mono=True)
-            if y.size == 0:
-                raise RuntimeError("듀엣 분리에 사용할 보컬 오디오가 비어 있습니다.")
+        window = max(3, int(window_frames))
+        if window % 2 == 0:
+            window += 1
+        half = window // 2
+        smoothed = labels.copy()
+        for index in range(labels.size):
+            if labels[index] < 0:
+                continue
+            start = max(0, index - half)
+            end = min(labels.size, index + half + 1)
+            local = labels[start:end]
+            local = local[local >= 0]
+            if local.size == 0:
+                continue
+            counts = np.bincount(local.astype(np.int16), minlength=2)
+            smoothed[index] = int(np.argmax(counts))
+        return smoothed
 
-            n_fft = 2048
-            hop_length = 512
-            stft = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
-            magnitude = np.maximum(np.abs(stft), 1e-8)
-            phase = np.exp(1j * np.angle(stft))
+    @staticmethod
+    def _segments_from_frame_labels(
+        frame_labels,
+        sample_rate: int,
+        hop_length: int,
+        min_segment_seconds: float,
+        merge_gap_seconds: float,
+    ) -> list[DiarizedSegment]:
+        labels = list(frame_labels)
+        raw_segments: list[DiarizedSegment] = []
+        start_frame: int | None = None
+        current_label: int | None = None
 
-            model = NMF(
-                n_components=2,
-                init="nndsvda",
-                solver="mu",
-                beta_loss="kullback-leibler",
-                max_iter=500,
-                random_state=0,
-            )
-            activations = model.fit_transform(magnitude.T)
-            bases = model.components_
-            component_magnitudes = [
-                (activations[:, index][:, np.newaxis] * bases[index][np.newaxis, :]).T
-                for index in range(2)
-            ]
-            total = component_magnitudes[0] + component_magnitudes[1] + 1e-8
+        for frame_index, label in enumerate(labels + [-1]):
+            label = int(label)
+            if label < 0:
+                if current_label is not None and start_frame is not None:
+                    start = start_frame * hop_length / sample_rate
+                    end = frame_index * hop_length / sample_rate
+                    if end - start >= min_segment_seconds:
+                        raw_segments.append(DiarizedSegment(start, end, f"cluster_{current_label}"))
+                current_label = None
+                start_frame = None
+                continue
 
-            outputs: list[tuple[float, Path]] = []
-            for index, component in enumerate(component_magnitudes, start=1):
-                mask = np.clip(component / total, 0.0, 1.0)
-                stem = librosa.istft(mask * magnitude * phase, hop_length=hop_length, length=len(y))
-                peak = float(np.max(np.abs(stem))) if stem.size else 0.0
-                if peak > 1.0:
-                    stem = stem / peak * 0.98
-                output = output_dir / f"singer{index}.wav"
-                sf.write(output, stem, sample_rate)
-                rms = float(np.sqrt(np.mean(np.square(stem)))) if stem.size else 0.0
-                outputs.append((rms, output))
+            if current_label is None:
+                current_label = label
+                start_frame = frame_index
+                continue
 
-            outputs.sort(key=lambda item: item[0], reverse=True)
-            return DuetSingerStems(first=outputs[0][1], second=outputs[1][1])
+            if label != current_label:
+                if start_frame is not None:
+                    start = start_frame * hop_length / sample_rate
+                    end = frame_index * hop_length / sample_rate
+                    if end - start >= min_segment_seconds:
+                        raw_segments.append(DiarizedSegment(start, end, f"cluster_{current_label}"))
+                current_label = label
+                start_frame = frame_index
 
-        return await asyncio.to_thread(separate)
+        if not raw_segments:
+            return []
+
+        merged: list[DiarizedSegment] = []
+        for segment in raw_segments:
+            if (
+                merged
+                and merged[-1].speaker == segment.speaker
+                and segment.start - merged[-1].end <= merge_gap_seconds
+            ):
+                previous = merged[-1]
+                merged[-1] = DiarizedSegment(previous.start, segment.end, previous.speaker)
+            else:
+                merged.append(segment)
+        return merged
+
+    @staticmethod
+    def _apply_segment_mask(mask, start: int, end: int, fade_samples: int) -> None:
+        import numpy as np
+
+        length = end - start
+        if length <= 0:
+            return
+
+        window = np.ones(length, dtype=np.float32)
+        fade = min(fade_samples, max(1, length // 2))
+        if fade > 1:
+            window[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            window[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+        mask[start:end] = np.maximum(mask[start:end], window)
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        minutes = int(seconds // 60)
+        remaining = seconds - minutes * 60
+        return f"{minutes:02d}:{remaining:05.2f}"
 
     @staticmethod
     def _shell_quote(value: str) -> str:
@@ -1031,6 +1450,46 @@ class AIProcessor:
     @staticmethod
     def _env_enabled(name: str) -> bool:
         return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _pyannote_load_error(model_name: str, exc: Exception) -> OptionalFeatureMissing:
+        message = str(exc)
+        lowered = message.lower()
+        hints: list[str] = []
+
+        if os.getenv("HF_HUB_OFFLINE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            hints.append("`HF_HUB_OFFLINE`가 켜져 있습니다. PowerShell에서 `Remove-Item Env:HF_HUB_OFFLINE` 후 다시 실행해 주세요.")
+        if "local cache" in lowered or "internet connection" in lowered or "locate the file" in lowered:
+            hints.append(
+                "모델이 아직 로컬 캐시에 없거나 Hugging Face 연결에 실패했습니다. "
+                "`huggingface-cli whoami`로 로그인 확인 후 "
+                f"`huggingface-cli download {model_name} config.yaml`로 다운로드가 되는지 확인해 주세요. "
+                "해당 명령이 없으면 `.\\.venv\\Scripts\\hf.exe auth whoami`와 "
+                f"`.\\.venv\\Scripts\\hf.exe download {model_name} config.yaml`를 사용하세요."
+            )
+        if "invalid user token" in lowered or "token stored is invalid" in lowered:
+            hints.append(
+                "저장된 Hugging Face 토큰이 유효하지 않습니다. 권한을 켠 새 토큰으로 "
+                "`huggingface-cli login` 또는 `.\\.venv\\Scripts\\hf.exe auth login --force`를 다시 실행해 주세요."
+            )
+        if "enable access to public gated repositories" in lowered or "fine-grained token" in lowered:
+            hints.append(
+                "현재 Hugging Face 토큰에서 public gated repositories 접근 권한이 꺼져 있습니다. "
+                "토큰 설정에서 gated repo read 권한을 켜거나, 해당 권한이 있는 새 Read 토큰으로 "
+                "`huggingface-cli login` 또는 `.\\.venv\\Scripts\\hf.exe auth login --force`를 다시 실행해 주세요."
+            )
+        if "403" in lowered or "gated" in lowered or "authorized" in lowered:
+            hints.append(
+                f"`https://huggingface.co/{model_name}`에서 같은 계정으로 사용 조건 동의/접근 승인을 완료해 주세요."
+            )
+        if not hints:
+            hints.append("Hugging Face 로그인, 모델 사용 조건 동의, 인터넷 연결 상태를 확인해 주세요.")
+
+        return OptionalFeatureMissing(
+            "PyAnnote Audio 모델을 불러오지 못했습니다.\n"
+            + "\n".join(f"- {hint}" for hint in hints)
+            + f"\n\n원본 오류: {message[-800:]}"
+        )
 
     @staticmethod
     def _looks_like_huggingface_model(model_name: str) -> bool:
@@ -1069,6 +1528,13 @@ class AIProcessor:
         return DuetSingerStems(first=candidates[0], second=candidates[1])
 
     @staticmethod
+    def _duet_stems_are_low_quality(stems: DuetSingerStems) -> bool:
+        return (
+            AIProcessor._duet_stems_are_imbalanced(stems)
+            or AIProcessor._duet_stems_are_too_similar(stems)
+        )
+
+    @staticmethod
     def _duet_stems_are_imbalanced(stems: DuetSingerStems) -> bool:
         first_rms = AIProcessor._audio_rms(stems.first)
         second_rms = AIProcessor._audio_rms(stems.second)
@@ -1079,6 +1545,32 @@ class AIProcessor:
 
         min_ratio = float(os.getenv("MULTI_SINGER_SEPARATOR_MIN_RMS_RATIO", "0.08"))
         return weaker / stronger < min_ratio
+
+    @staticmethod
+    def _duet_stems_are_too_similar(stems: DuetSingerStems) -> bool:
+        correlation = AIProcessor._audio_correlation(stems.first, stems.second)
+        max_correlation = float(os.getenv("MULTI_SINGER_SEPARATOR_MAX_CORRELATION", "0.92"))
+        return correlation >= max_correlation
+
+    @staticmethod
+    def _audio_correlation(first: Path, second: Path) -> float:
+        try:
+            import numpy as np
+            import soundfile as sf
+
+            first_audio, _ = sf.read(first, always_2d=True)
+            second_audio, _ = sf.read(second, always_2d=True)
+            length = min(len(first_audio), len(second_audio))
+            if length < 1024:
+                return 1.0
+
+            first_mono = np.asarray(first_audio[:length], dtype=np.float32).mean(axis=1)
+            second_mono = np.asarray(second_audio[:length], dtype=np.float32).mean(axis=1)
+            if np.std(first_mono) <= 1e-8 or np.std(second_mono) <= 1e-8:
+                return 1.0
+            return float(np.corrcoef(first_mono, second_mono)[0, 1])
+        except Exception:
+            return 0.0
 
     @staticmethod
     def _audio_rms(path: Path) -> float:

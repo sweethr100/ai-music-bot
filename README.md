@@ -9,6 +9,7 @@
 - `/play` AI 커버 생성 및 재생
 - `/play_file` 유저가 업로드한 파일로 원본/MR/보컬/AI 커버 생성 및 재생
 - `/play_duet` AI 듀엣 생성 및 재생
+- `/separate_singers` 가수별 보컬 stem MP3 분리 테스트
 - `/record_start`, `/record_stop`, `/record_status` 유저별 학습용 음성 녹음
 - `/train_voice` 녹음 데이터로 RVC 목소리 모델 자동 학습
 - `/playlist` 유튜브 재생목록 전체 추가
@@ -135,9 +136,76 @@ AI_COVER_INPUT_VOCAL_FILTER=none
 AI_COVER_OUTPUT_VOCAL_FILTER=none
 ```
 
-AI 듀엣은 `/play_duet`에서 `voice1`과 `voice2`를 고르면 실행됩니다. 두 옵션은 모두 필수이며, 원곡 가수를 그대로 둘 파트는 `원본 가수`를 선택합니다. `scripts/install.ps1`은 기본 가수 분리 모델 실행에 필요한 Asteroid를 설치하고, `.env` 설정이 없으면 `Cyru5/MedleyVox`를 자동으로 사용합니다.
+AI 듀엣은 `/play_duet`에서 `voice1`과 `voice2`를 고르면 실행됩니다. 두 옵션은 모두 필수이며, 원곡 가수를 그대로 둘 파트는 `원본 가수`를 선택합니다. 기본 듀엣 분리는 PyAnnote Audio로 “몇 분 몇 초에 누가 부르는지” 시간표를 만든 뒤, 그 구간만 잘라서 1번/2번 파트로 보냅니다.
 
-Windows에서 `asteroid` 설치 중 `pesq` 빌드 오류가 나면 Microsoft C++ Build Tools를 설치한 뒤 `scripts/install.ps1`을 다시 실행합니다. 기본값 대신 다른 multi-singer 모델을 쓰고 싶을 때만 아래 값을 `.env`에 넣습니다.
+PyAnnote Audio는 기본 설치에 포함됩니다.
+
+```powershell
+.\scripts\install.ps1
+```
+
+PyAnnote 공식 모델을 쓰려면 Hugging Face에서 모델 사용 조건에 동의하고 로그인해야 합니다. 기본 모델은 Community-1입니다.
+
+1. Hugging Face 계정을 만듭니다: https://huggingface.co/join
+2. `pyannote/speaker-diarization-community-1` 페이지에서 사용 조건에 동의합니다: https://huggingface.co/pyannote/speaker-diarization-community-1
+3. Hugging Face 토큰을 만듭니다: https://huggingface.co/settings/tokens
+   - fine-grained token을 만들면 `Read access to contents of all public gated repos you can access` 권한을 켭니다.
+   - 헷갈리면 classic `read` 토큰을 만들어도 됩니다.
+4. PowerShell에서 로그인합니다.
+
+```powershell
+huggingface-cli login
+huggingface-cli whoami
+```
+
+`login` 명령어가 토큰을 물어보면 3번에서 만든 토큰을 붙여넣습니다. `whoami`가 내 Hugging Face 계정을 출력하면 로그인 캐시가 준비된 상태입니다. 이미 봇이 켜져 있었다면 봇을 재시작해 주세요. 로그인 캐시를 쓰므로 `.env`에 토큰을 넣을 필요는 없습니다.
+
+`huggingface-cli`가 없거나 deprecated 오류가 나면 프로젝트 venv의 최신 CLI를 사용합니다.
+
+```powershell
+.\.venv\Scripts\hf.exe auth login --force
+.\.venv\Scripts\hf.exe auth whoami
+```
+
+403 또는 `not in the authorized list`가 뜨면 Community-1 모델 페이지에서 사용 조건 동의가 아직 처리되지 않은 상태입니다. 같은 계정으로 https://huggingface.co/pyannote/speaker-diarization-community-1 에 들어가 조건 동의/접근 요청을 완료한 뒤 다시 실행합니다.
+
+`cannot find the requested files in the local cache` 또는 `Please check your connection`이 뜨면 모델이 아직 캐시에 없는데 Hugging Face 연결이 실패한 상태입니다. 먼저 오프라인 모드가 켜져 있지 않은지 확인하고, 모델 다운로드가 되는지 테스트합니다.
+
+```powershell
+Get-ChildItem Env:HF_HUB_OFFLINE
+Remove-Item Env:HF_HUB_OFFLINE
+huggingface-cli whoami
+huggingface-cli download pyannote/speaker-diarization-community-1 config.yaml
+```
+
+`huggingface-cli download`가 동작하지 않으면 대체 명령을 사용합니다.
+
+```powershell
+.\.venv\Scripts\hf.exe auth whoami
+.\.venv\Scripts\hf.exe download pyannote/speaker-diarization-community-1 config.yaml
+```
+
+`Invalid user token`이 뜨면 저장된 토큰이 만료되었거나 잘못된 상태입니다. 권한을 켠 새 토큰으로 `huggingface-cli login` 또는 `.\.venv\Scripts\hf.exe auth login --force`를 다시 실행합니다.
+
+`Please enable access to public gated repositories in your fine-grained token settings`가 뜨면 토큰 권한 문제입니다. https://huggingface.co/settings/tokens 에서 현재 토큰의 gated repo read 권한을 켜거나, 권한을 켠 새 토큰으로 다시 로그인합니다.
+
+기본 백엔드는 다음과 같습니다.
+
+```env
+MULTI_SINGER_SEPARATOR_BACKEND=pyannote
+PYANNOTE_DIARIZATION_MODEL=pyannote/speaker-diarization-community-1
+PYANNOTE_DEVICE=cuda
+```
+
+PyAnnote 없이 로컬 방식만 쓰고 싶으면:
+
+```env
+MULTI_SINGER_SEPARATOR_BACKEND=local_diarization
+```
+
+이 방식들은 실제 source separation이 아니라 diarization 기반 시간 절단 방식입니다. 두 사람이 동시에 부르는 화음/후렴은 완전 분리하지 못하고, 파트가 번갈아 나오는 듀엣에서 가장 잘 맞습니다.
+
+다른 multi-singer 모델을 실험하고 싶을 때만 아래 값을 `.env`에 넣습니다.
 
 ```env
 MULTI_SINGER_SEPARATOR_BACKEND=asteroid
@@ -153,7 +221,7 @@ MULTI_SINGER_SEPARATOR_COMMAND=python path/to/infer.py --input {input} --output_
 
 외부 명령은 `{output_dir}` 안에 두 가수의 WAV stem을 만들어야 합니다. 예: `singer1.wav`, `singer2.wav`.
 
-내장 자동 듀엣 분리기는 모델 실행이 실패해도 설정 없이 바로 쓸 수 있는 fallback입니다. 곡마다 두 가수 배정이 완벽하지 않을 수 있으므로, 전용 모델 없이는 듀엣 품질이 원곡의 믹싱 상태에 따라 달라집니다. 전용 모델 없이 실행되는 것을 막고 싶다면 `MULTI_SINGER_SEPARATOR_REQUIRE_MODEL=true`를 설정합니다.
+PyAnnote가 실패하면 듀엣 처리는 중단됩니다. 곡마다 두 가수 배정이 완벽하지 않을 수 있으므로, 듀엣 품질은 원곡의 믹싱 상태와 두 보컬의 음색 차이에 따라 달라집니다.
 
 ## 목소리 녹음과 자동 학습
 
@@ -210,6 +278,7 @@ python bot.py
 /play_file file:<업로드 파일> target_voice:myvoice vocal_pitch_shift:+6
 /play_duet query:artist duet song voice1:원본 가수 voice2:voice2
 /play_duet query:artist duet song voice1:voice1 voice2:voice2
+/separate_singers query:artist duet song
 /record_start
 /record_status
 /record_stop
@@ -227,13 +296,14 @@ python bot.py
 - `/play` 안에서 일반 재생, MR/보컬 분리, AI 커버를 다룹니다.
 - `/play_file`은 유튜브 다운로드 대신 Discord 첨부 파일을 저장한 뒤 `/play`와 같은 오디오 처리 파이프라인을 사용합니다.
 - `/play_duet`은 AI 듀엣 커버만 다룹니다.
+- `/separate_singers`는 커버 변환 없이 가수별 보컬 stem만 각각 MP3로 올려 분리 품질을 확인합니다.
 - AI 커버는 `mode`가 아니라 `target_voice`에 목소리 모델을 고르면 자동으로 적용됩니다. `target_voice`의 `원본 가수`는 AI 변환을 하지 않는 선택지입니다.
 - 일반 재생은 스트리밍 방식이라 다운로드 파일을 남기지 않습니다.
 - 보컬 분리는 Roformer 기반 `audio-separator`를 사용하고, 실패하면 중단합니다.
 - AI 커버는 Applio 환경의 CUDA PyTorch를 사용합니다.
 - 목소리 녹음은 `discord-ext-voice-recv`로 수신하고, 음악 재생 연결과 같은 voice client를 공유합니다.
 - 학습 데이터는 `data/recordings`에, 완성 모델은 기존 AI 커버와 같은 `voice_models`에 저장합니다.
-- AI 듀엣은 기본 multi-singer separator 또는 fallback 분리기로 두 가수 stem을 자동 분리한 뒤 각각 변환합니다.
+- AI 듀엣은 PyAnnote 또는 로컬 시간표 분리기로 두 가수 stem을 자동 분리한 뒤 각각 변환합니다.
 - AI 처리 결과물은 `data/processed`에 저장되고, 재생이 끝나거나 대기열에서 삭제되면 정리됩니다.
 - 플레이리스트는 목록만 먼저 가져오고, 실제 스트림 URL은 재생 직전에 다시 가져와 만료 문제를 줄입니다.
 - 노멀라이저는 현재 곡 다음부터 적용됩니다.

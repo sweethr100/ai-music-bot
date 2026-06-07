@@ -36,6 +36,7 @@ class TrackInfo:
     duration: int
     thumbnail: str
     stream_url: str | None = None
+    artist: str = ""
 
     def duration_text(self) -> str:
         if not self.duration:
@@ -129,4 +130,5 @@ class YouTubeService:
             duration=info.get("duration") or 0,
             thumbnail=info.get("thumbnail") or "",
             stream_url=info.get("url"),
+            artist=info.get("artist") or info.get("creator") or info.get("uploader") or "",
         )

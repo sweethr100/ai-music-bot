@@ -44,6 +44,13 @@ install_applio_prerequisite_models() {
   )
 }
 
+install_pyannote_diarization() {
+  local python_exe="$1"
+  echo "Installing PyAnnote Audio diarization support..."
+  "$python_exe" -m pip install "pyannote.audio>=4.0.0"
+  "$python_exe" -c "from pyannote.audio import Pipeline; print('PyAnnote Audio OK')"
+}
+
 test_cuda_torch() {
   local python_exe="$1"
   local label="$2"
@@ -67,6 +74,8 @@ install_cuda_torch python
 
 echo "Installing bot + AI music dependencies..."
 python -m pip install -r "$ROOT/requirements.txt"
+install_cuda_torch python
+install_pyannote_diarization python
 install_cuda_torch python
 test_cuda_torch python "Bot"
 

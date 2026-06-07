@@ -9,3 +9,4 @@ soundfile>=0.12.1
 audio-separator[gpu]>=0.44.2
 librosa>=0.11.0
 scikit-learn>=1.4.0
+pyannote.audio>=4.0.0

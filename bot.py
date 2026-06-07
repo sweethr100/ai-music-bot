@@ -29,12 +29,15 @@ class AIMusicBot(commands.Bot):
 
         if self.settings.guild_id:
             guild = discord.Object(id=self.settings.guild_id)
+            self.tree.clear_commands(guild=guild)
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            print(f"Synced slash commands to guild {self.settings.guild_id}")
+            synced = await self.tree.sync(guild=guild)
+            names = ", ".join(command.name for command in synced)
+            print(f"Synced slash commands to guild {self.settings.guild_id}: {names}")
         else:
-            await self.tree.sync()
-            print("Synced global slash commands")
+            synced = await self.tree.sync()
+            names = ", ".join(command.name for command in synced)
+            print(f"Synced global slash commands: {names}")
 
     async def on_ready(self) -> None:
         print(f"Ready as {self.user} ({self.user.id})")

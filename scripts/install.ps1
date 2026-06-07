@@ -101,6 +101,17 @@ function Install-MultiSingerSeparator {
     )
 }
 
+function Install-PyannoteDiarization {
+    param([string]$PythonExe)
+
+    Write-Host "Installing PyAnnote Audio diarization support..."
+    Invoke-Checked $PythonExe @("-m", "pip", "install", "pyannote.audio>=4.0.0")
+    Invoke-Checked $PythonExe @(
+        "-c",
+        "from pyannote.audio import Pipeline; print('PyAnnote Audio OK')"
+    )
+}
+
 function Test-CudaTorch {
     param([string]$PythonExe, [string]$Label)
     Invoke-Checked $PythonExe @("-c", "import torch; assert torch.cuda.is_available(), 'CUDA is not available'; print('$Label CUDA OK:', torch.__version__, torch.cuda.get_device_name(0))")
@@ -122,7 +133,14 @@ Install-CudaTorch -PythonExe "python"
 Write-Host "Installing bot + AI music dependencies..."
 Invoke-Checked "python" @("-m", "pip", "install", "-r", (Join-Path $Root "requirements.txt"))
 Install-CudaTorch -PythonExe "python"
-Install-MultiSingerSeparator -PythonExe "python"
+$InstallMultiSingerSeparator = $env:INSTALL_MULTI_SINGER_SEPARATOR
+if ($InstallMultiSingerSeparator -and $InstallMultiSingerSeparator.ToLowerInvariant() -in @("1", "true", "yes", "on")) {
+    Install-MultiSingerSeparator -PythonExe "python"
+} else {
+    Write-Host "Skipping optional Asteroid / MedleyVox duet separator. Built-in NMF duet separation works without it."
+}
+Install-PyannoteDiarization -PythonExe "python"
+Install-CudaTorch -PythonExe "python"
 Test-CudaTorch -PythonExe "python" -Label "Bot"
 
 if (-not (Test-Path $VendorDir)) {
