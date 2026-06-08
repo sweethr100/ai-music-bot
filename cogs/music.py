@@ -12,9 +12,11 @@ from discord import app_commands
 from discord.ext import commands
 
 from services.ai_audio import (
+    DuetPartSetting,
     ORIGINAL_SINGER_NAME,
     ORIGINAL_SINGER_VALUE,
     OptionalFeatureMissing,
+    PreparedDuetProject,
     is_original_singer_voice,
 )
 from services.voice_patch import PatchedVoiceRecvClient
@@ -121,6 +123,169 @@ class LyricsView(discord.ui.View):
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
 
+class DuetPartSettingsModal(discord.ui.Modal):
+    def __init__(self, view: DuetSetupView, part_index: int):
+        super().__init__(title=f"{part_index}번 파트 설정")
+        self.setup_view = view
+        self.part_index = part_index
+        setting = view.settings[part_index - 1]
+        self.pitch = discord.ui.TextInput(
+            label="피치 (-12 ~ 12)",
+            default=str(setting.pitch_shift),
+            required=True,
+            max_length=4,
+        )
+        self.volume = discord.ui.TextInput(
+            label="볼륨 (0.0 ~ 2.5)",
+            default=f"{setting.volume:.2f}",
+            required=True,
+            max_length=5,
+        )
+        self.add_item(self.pitch)
+        self.add_item(self.volume)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not self.setup_view.can_use(interaction):
+            await interaction.response.send_message("이 듀엣 설정은 명령어를 실행한 사람만 바꿀 수 있습니다.", ephemeral=True)
+            return
+
+        try:
+            pitch = max(-12, min(12, int(str(self.pitch.value).strip())))
+            volume = max(0.0, min(2.5, float(str(self.volume.value).strip())))
+        except ValueError:
+            await interaction.response.send_message("피치는 정수, 볼륨은 숫자로 입력해 주세요.", ephemeral=True)
+            return
+
+        current = self.setup_view.settings[self.part_index - 1]
+        self.setup_view.settings[self.part_index - 1] = DuetPartSetting(
+            voice=current.voice,
+            pitch_shift=pitch,
+            volume=volume,
+        )
+        await interaction.response.edit_message(embed=self.setup_view.embed(), view=self.setup_view)
+
+
+class DuetVoiceSelect(discord.ui.Select):
+    def __init__(self, setup_view: DuetSetupView, part_index: int, voices: list[str]):
+        self.setup_view = setup_view
+        self.part_index = part_index
+        options = [
+            discord.SelectOption(label=ORIGINAL_SINGER_NAME, value=ORIGINAL_SINGER_VALUE),
+        ]
+        for voice in voices[:24]:
+            options.append(discord.SelectOption(label=voice, value=voice))
+        super().__init__(
+            placeholder=f"{part_index}번 파트 목소리 선택",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=part_index - 1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not self.setup_view.can_use(interaction):
+            await interaction.response.send_message("이 듀엣 설정은 명령어를 실행한 사람만 바꿀 수 있습니다.", ephemeral=True)
+            return
+        current = self.setup_view.settings[self.part_index - 1]
+        self.setup_view.settings[self.part_index - 1] = DuetPartSetting(
+            voice=self.values[0],
+            pitch_shift=current.pitch_shift,
+            volume=current.volume,
+        )
+        await interaction.response.edit_message(embed=self.setup_view.embed(), view=self.setup_view)
+
+
+class DuetSetupView(discord.ui.View):
+    def __init__(
+        self,
+        cog: MusicCog,
+        owner_id: int,
+        project: PreparedDuetProject,
+        delivery: str,
+        voice_channel: discord.VoiceChannel | None,
+    ):
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.project = project
+        self.delivery = delivery
+        self.voice_channel = voice_channel
+        self.rendered = False
+        self.cancelled = False
+        self.settings = [
+            DuetPartSetting(voice=ORIGINAL_SINGER_NAME, pitch_shift=0, volume=1.0)
+            for _ in project.stems
+        ]
+
+        voices = cog.bot.ai_processor.available_voices()
+        for index, _ in enumerate(project.stems, start=1):
+            self.add_item(DuetVoiceSelect(self, index, voices))
+
+    def can_use(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    def embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="AI 듀엣 설정",
+            description=f"**{self.project.title}**\n미리듣기 파일을 확인한 뒤 각 파트 설정을 고르세요.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="분리된 보컬 수", value=str(len(self.project.stems)), inline=True)
+        for stem, setting in zip(self.project.stems, self.settings, strict=True):
+            voice = ORIGINAL_SINGER_NAME if is_original_singer_voice(setting.voice) else setting.voice
+            embed.add_field(
+                name=f"{stem.index}번 파트",
+                value=(
+                    f"목소리: `{voice}`\n"
+                    f"피치: `{setting.pitch_shift:+d}`\n"
+                    f"볼륨: `{setting.volume:.2f}`\n"
+                    f"RMS: `{stem.rms:.4f}`"
+                ),
+                inline=True,
+            )
+        embed.set_footer(text="목소리는 드롭다운에서 고르고, 상세 설정에서는 피치와 볼륨만 조절합니다.")
+        return embed
+
+    async def on_timeout(self) -> None:
+        if not self.rendered and not self.cancelled:
+            self.cog.bot.ai_processor.cleanup_prepared_duet(self.project)
+
+    @discord.ui.button(label="1번 파트 상세", style=discord.ButtonStyle.secondary, row=2)
+    async def edit_part1(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not self.can_use(interaction):
+            await interaction.response.send_message("이 듀엣 설정은 명령어를 실행한 사람만 바꿀 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.send_modal(DuetPartSettingsModal(self, 1))
+
+    @discord.ui.button(label="2번 파트 상세", style=discord.ButtonStyle.secondary, row=2)
+    async def edit_part2(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not self.can_use(interaction):
+            await interaction.response.send_message("이 듀엣 설정은 명령어를 실행한 사람만 바꿀 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.send_modal(DuetPartSettingsModal(self, 2))
+
+    @discord.ui.button(label="듀엣 렌더", style=discord.ButtonStyle.success, row=2)
+    async def render(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not self.can_use(interaction):
+            await interaction.response.send_message("이 듀엣 설정은 명령어를 실행한 사람만 바꿀 수 있습니다.", ephemeral=True)
+            return
+        await self.cog._render_duet_setup(interaction, self)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.danger, row=2)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not self.can_use(interaction):
+            await interaction.response.send_message("이 듀엣 설정은 명령어를 실행한 사람만 바꿀 수 있습니다.", ephemeral=True)
+            return
+        self.cancelled = True
+        self.cog.bot.ai_processor.cleanup_prepared_duet(self.project)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            embed=self.cog._simple_embed("AI 듀엣 설정 취소", "임시 분리 파일을 정리했습니다.", discord.Color.red()),
+            view=self,
+        )
+
+
 class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -189,6 +354,107 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=ephemeral)
         else:
             await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+    async def _render_duet_setup(self, interaction: discord.Interaction, setup_view: DuetSetupView) -> None:
+        await interaction.response.defer()
+        upload_file = setup_view.delivery in {"upload_and_play", "upload_only"}
+        play_in_voice = setup_view.delivery in {"upload_and_play", "voice_only"}
+
+        if play_in_voice:
+            voice_client = await self._ensure_voice(interaction, setup_view.voice_channel)
+            if not voice_client:
+                return
+
+        try:
+            status = await self._send_followup_embed(
+                interaction,
+                "AI 듀엣 렌더 준비 중",
+                "선택한 파트 설정으로 최종 듀엣 파일을 만들고 있습니다.",
+            )
+
+            async def progress(text: str) -> None:
+                try:
+                    await self._edit_processing_status(status, "AI듀엣", text)
+                except discord.HTTPException:
+                    pass
+
+            processed = await self.bot.ai_processor.render_prepared_duet(
+                setup_view.project,
+                setup_view.settings,
+                progress,
+            )
+            labels = [
+                ORIGINAL_SINGER_NAME if is_original_singer_voice(setting.voice) else setting.voice
+                for setting in setup_view.settings
+            ]
+            pitch_text = ", ".join(f"{index}:{setting.pitch_shift:+d}" for index, setting in enumerate(setup_view.settings, start=1))
+            track = TrackInfo(
+                title=f"[{self._mode_label('ai_duet')}] {processed.title}",
+                webpage_url=processed.webpage_url,
+                duration=processed.duration,
+                thumbnail=processed.thumbnail,
+            )
+            song = Song(
+                track,
+                interaction.user.id,
+                interaction.user.display_name,
+                local_path=processed.path,
+                mode="ai_duet",
+                target_voice=labels[0] if labels else None,
+                duet_voice=" + ".join(labels[1:]) if len(labels) > 1 else None,
+            )
+            if pitch_text:
+                song.vocal_pitch_shift = 0
+
+            if play_in_voice:
+                self._prewarm_normalizer(interaction.guild_id, song)
+
+            uploaded = True
+            if upload_file:
+                uploaded = await self._send_song_file(interaction, song)
+
+            if play_in_voice:
+                await self._enqueue(interaction, song)
+
+            await self._edit_play_result_status(
+                status,
+                song,
+                play_in_voice=play_in_voice,
+                upload_file=upload_file,
+                uploaded=uploaded,
+            )
+            if not play_in_voice:
+                self._cleanup_song(song)
+
+            setup_view.rendered = True
+            self.bot.ai_processor.cleanup_prepared_duet(setup_view.project)
+            for item in setup_view.children:
+                item.disabled = True
+            if interaction.message:
+                await interaction.message.edit(
+                    embed=self._simple_embed(
+                        "AI 듀엣 렌더 완료",
+                        "설정 패널을 닫았습니다. 최종 파일은 위 결과 메시지를 확인하세요.",
+                        discord.Color.green(),
+                    ),
+                    view=setup_view,
+                )
+        except OptionalFeatureMissing as exc:
+            await self._send_followup_embed(
+                interaction,
+                "기능을 사용할 수 없습니다",
+                str(exc),
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await self._send_followup_embed(
+                interaction,
+                "듀엣 렌더 중 오류가 발생했습니다",
+                f"```{str(exc)[:1500]}```",
+                color=discord.Color.red(),
+                ephemeral=True,
+            )
 
     @staticmethod
     async def _edit_message_embed(
@@ -723,9 +989,6 @@ class MusicCog(commands.Cog):
     @app_commands.command(name="play_duet", description="AI 듀엣 커버를 가수별 자동 분리로 만듭니다.")
     @app_commands.describe(
         query="유튜브 URL 또는 검색어",
-        voice1="AI 듀엣 1번 목소리 이름",
-        voice2="AI 듀엣 2번 목소리 이름",
-        vocal_pitch_shift="목소리 피치만 조절. -12부터 +12까지 정수로 입력",
         delivery="결과 파일을 채팅에 올릴지, 통화방에서 틀지도 함께 선택",
         voice_channel="명령어 사용자가 음성 채널에 없어도 재생할 음성 채널",
     )
@@ -734,30 +997,17 @@ class MusicCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         query: str,
-        voice1: str,
-        voice2: str,
-        vocal_pitch_shift: app_commands.Range[int, -12, 12] = 0,
         delivery: str = "upload_and_play",
         voice_channel: discord.VoiceChannel | None = None,
     ):
         await interaction.response.defer()
-        upload_file = delivery in {"upload_and_play", "upload_only"}
-        play_in_voice = delivery in {"upload_and_play", "voice_only"}
-
-        if play_in_voice:
-            voice_client = await self._ensure_voice(interaction, voice_channel)
-            if not voice_client:
-                return
-
-        effective_mode = "ai_duet"
-        voice1_label = ORIGINAL_SINGER_NAME if is_original_singer_voice(voice1) else voice1
-        voice2_label = ORIGINAL_SINGER_NAME if is_original_singer_voice(voice2) else voice2
+        project = None
         try:
-            mode_label = self._mode_label(effective_mode)
+            mode_label = self._mode_label("ai_duet")
             status = await self._send_followup_embed(
                 interaction,
-                f"{mode_label} 준비 중",
-                "AI 듀엣 커버를 처리할 준비를 하고 있습니다.",
+                "AI 듀엣 분리 준비 중",
+                "곡을 받아서 보컬 파트를 분리하고 미리듣기 파일을 만들고 있습니다.",
             )
 
             async def progress(text: str) -> None:
@@ -766,51 +1016,42 @@ class MusicCog(commands.Cog):
                 except discord.HTTPException:
                     pass
 
-            processed = await self.bot.ai_processor.process_youtube(
-                url=query,
-                mode=effective_mode,
-                target_voice=voice1,
-                vocal_pitch_shift=vocal_pitch_shift,
-                progress=progress,
-                duet_voice=voice2,
-            )
-            track = TrackInfo(
-                title=f"[{self._mode_label(effective_mode)}] {processed.title}",
-                webpage_url=processed.webpage_url,
-                duration=processed.duration,
-                thumbnail=processed.thumbnail,
-            )
-            song = Song(
-                track,
-                interaction.user.id,
-                interaction.user.display_name,
-                local_path=processed.path,
-                mode=effective_mode,
-                target_voice=voice1_label,
-                duet_voice=voice2_label,
-                vocal_pitch_shift=vocal_pitch_shift,
-            )
-
-            if play_in_voice:
-                self._prewarm_normalizer(interaction.guild_id, song)
-
-            uploaded = True
-            if upload_file:
-                uploaded = await self._send_song_file(interaction, song)
-
-            if play_in_voice:
-                await self._enqueue(interaction, song)
-
-            await self._edit_play_result_status(
+            project = await self.bot.ai_processor.prepare_youtube_duet(query, progress)
+            await self._edit_message_embed(
                 status,
-                song,
-                play_in_voice=play_in_voice,
-                upload_file=upload_file,
-                uploaded=uploaded,
+                "AI 듀엣 분리 완료",
+                "아래 미리듣기 파일을 확인한 뒤 파트별 목소리/피치/볼륨을 설정하세요.",
+                color=discord.Color.green(),
             )
-            if not play_in_voice:
-                self._cleanup_song(song)
+
+            for stem in project.stems:
+                preview_track = TrackInfo(
+                    title=f"[듀엣 미리듣기 {stem.index}] {project.title}",
+                    webpage_url=project.webpage_url,
+                    duration=project.duration,
+                    thumbnail=project.thumbnail,
+                )
+                preview_song = Song(
+                    preview_track,
+                    interaction.user.id,
+                    interaction.user.display_name,
+                    local_path=str(stem.preview_path),
+                    mode="vocal",
+                )
+                await self._send_song_file(interaction, preview_song)
+
+            view = DuetSetupView(
+                cog=self,
+                owner_id=interaction.user.id,
+                project=project,
+                delivery=delivery,
+                voice_channel=voice_channel,
+            )
+            await interaction.followup.send(embed=view.embed(), view=view)
+            project = None
         except OptionalFeatureMissing as exc:
+            if project:
+                self.bot.ai_processor.cleanup_prepared_duet(project)
             await self._send_followup_embed(
                 interaction,
                 "기능을 사용할 수 없습니다",
@@ -819,6 +1060,8 @@ class MusicCog(commands.Cog):
                 ephemeral=True,
             )
         except Exception as exc:
+            if project:
+                self.bot.ai_processor.cleanup_prepared_duet(project)
             await self._send_followup_embed(
                 interaction,
                 "처리 중 오류가 발생했습니다",
@@ -826,14 +1069,6 @@ class MusicCog(commands.Cog):
                 color=discord.Color.red(),
                 ephemeral=True,
             )
-
-    @play_duet.autocomplete("voice1")
-    async def play_duet_voice1_autocomplete(self, interaction: discord.Interaction, current: str):
-        return self._voice_autocomplete_choices(current, include_original=True)
-
-    @play_duet.autocomplete("voice2")
-    async def play_duet_voice2_autocomplete(self, interaction: discord.Interaction, current: str):
-        return self._voice_autocomplete_choices(current, include_original=True)
 
     @app_commands.command(name="separate_singers", description="유튜브 곡을 가수별 보컬 stem MP3로 분리해 올립니다.")
     @app_commands.describe(query="유튜브 URL 또는 검색어")

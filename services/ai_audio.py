@@ -68,6 +68,32 @@ class DuetSingerStems:
 
 
 @dataclass(frozen=True)
+class PreparedDuetStem:
+    index: int
+    path: Path
+    preview_path: Path
+    rms: float
+
+
+@dataclass(frozen=True)
+class PreparedDuetProject:
+    work_dir: Path
+    title: str
+    duration: int
+    webpage_url: str
+    thumbnail: str
+    instrumental: Path
+    stems: tuple[PreparedDuetStem, ...]
+
+
+@dataclass(frozen=True)
+class DuetPartSetting:
+    voice: str
+    pitch_shift: int = 0
+    volume: float = 1.0
+
+
+@dataclass(frozen=True)
 class DiarizedSegment:
     start: float
     end: float
@@ -507,6 +533,95 @@ class AIProcessor:
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
+    async def prepare_youtube_duet(self, url: str, progress) -> PreparedDuetProject:
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix="ai_music_duet_", dir=str(self.temp_dir)))
+        try:
+            await progress("유튜브 오디오를 다운로드하는 중...")
+            input_wav, title, duration, webpage_url, thumbnail = await self._download_audio(url, work_dir)
+
+            await progress("보컬과 반주를 분리하는 중...")
+            vocals, instrumental = await self._separate_vocals(input_wav, work_dir, progress)
+            vocals = await self._prepare_vocals_for_conversion(vocals, work_dir, progress)
+
+            await progress("PyAnnote Audio로 듀엣 파트를 분리하는 중...")
+            duet_stems = await self._separate_duet_singers(vocals, work_dir, progress)
+
+            prepared_stems: list[PreparedDuetStem] = []
+            for index, stem in enumerate((duet_stems.first, duet_stems.second), start=1):
+                preview = work_dir / f"duet_part_{index}_preview.mp3"
+                await progress(f"{index}번 파트 미리듣기 파일을 만드는 중...")
+                await self._export_active_preview(stem, preview, work_dir, index)
+                prepared_stems.append(
+                    PreparedDuetStem(
+                        index=index,
+                        path=stem,
+                        preview_path=preview,
+                        rms=self._audio_rms(stem),
+                    )
+                )
+
+            return PreparedDuetProject(
+                work_dir=work_dir,
+                title=title,
+                duration=duration,
+                webpage_url=webpage_url,
+                thumbnail=thumbnail,
+                instrumental=instrumental,
+                stems=tuple(prepared_stems),
+            )
+        except Exception:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise
+
+    async def render_prepared_duet(
+        self,
+        project: PreparedDuetProject,
+        settings: list[DuetPartSetting],
+        progress,
+    ) -> ProcessedAudio:
+        if len(settings) != len(project.stems):
+            raise ValueError("듀엣 stem 개수와 파트 설정 개수가 맞지 않습니다.")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_title = self._safe_name(project.title)
+        rendered_parts: list[tuple[Path, float, str]] = []
+
+        for stem, setting in zip(project.stems, settings, strict=True):
+            voice = setting.voice or ORIGINAL_SINGER_VALUE
+            is_original = is_original_singer_voice(voice)
+            if is_original:
+                await progress(f"{stem.index}번 파트 피치/볼륨을 적용하는 중...")
+                rendered = await self._vocal_with_pitch_shift(
+                    stem.path,
+                    project.work_dir,
+                    setting.pitch_shift,
+                    progress,
+                )
+                voice_name = ORIGINAL_SINGER_NAME
+            else:
+                await progress(f"{stem.index}번 파트를 {voice} 목소리로 변환하는 중...")
+                rendered = await self.rvc.convert(stem.path, project.work_dir, voice, setting.pitch_shift)
+                rendered = await self._polish_converted_vocal(rendered, project.work_dir)
+                voice_name = voice
+            rendered_parts.append((rendered, setting.volume, voice_name))
+
+        voice_slug = "_".join(self._safe_name(name) for _, _, name in rendered_parts)
+        output = self.output_dir / f"AI_DUET_{voice_slug}_{safe_title}_{timestamp}.mp3"
+        await progress("설정한 파트 볼륨으로 듀엣을 합성하는 중...")
+        await self._merge_duet_parts(rendered_parts, project.instrumental, output)
+        return ProcessedAudio(
+            path=str(output),
+            title=project.title,
+            duration=project.duration,
+            webpage_url=project.webpage_url,
+            thumbnail=project.thumbnail,
+        )
+
+    @staticmethod
+    def cleanup_prepared_duet(project: PreparedDuetProject) -> None:
+        shutil.rmtree(project.work_dir, ignore_errors=True)
+
     async def separate_youtube_singers(self, url: str, progress) -> list[ProcessedAudio]:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         work_dir = Path(tempfile.mkdtemp(prefix="ai_music_singers_", dir=str(self.temp_dir)))
@@ -933,6 +1048,12 @@ class AIProcessor:
             )
             if not segments:
                 raise RuntimeError("로컬 시간표 분리기가 두 보컬 구간을 만들지 못했습니다.")
+            segments, pitch_notes, pitch_speaker_order = self._refine_duet_segments_by_pitch(
+                y,
+                sample_rate,
+                segments,
+                min_segment_seconds=min_segment_seconds,
+            )
 
             speaker_stats: dict[str, dict[str, float]] = {}
             for segment in segments:
@@ -951,7 +1072,7 @@ class AIProcessor:
                 key=lambda speaker: speaker_stats[speaker]["duration"],
                 reverse=True,
             )[:2]
-            chosen_speakers.sort(key=lambda speaker: speaker_stats[speaker]["first_start"])
+            chosen_speakers = self._order_duet_speakers(chosen_speakers, speaker_stats, pitch_speaker_order)
             speaker_to_index = {speaker: index for index, speaker in enumerate(chosen_speakers)}
 
             masks = [np.zeros(len(y), dtype=np.float32), np.zeros(len(y), dtype=np.float32)]
@@ -986,6 +1107,8 @@ class AIProcessor:
 
             report = output_dir / "local_diarization_segments.txt"
             with report.open("w", encoding="utf-8") as file:
+                if pitch_notes:
+                    file.write("\n".join(pitch_notes) + "\n\n")
                 for segment in sorted(segments, key=lambda item: item.start):
                     mapped = speaker_to_index.get(segment.speaker)
                     if mapped is None:
@@ -1083,6 +1206,12 @@ class AIProcessor:
 
             if not segments:
                 raise RuntimeError("PyAnnote Audio가 보컬 구간을 찾지 못했습니다.")
+            segments, pitch_notes, pitch_speaker_order = self._refine_duet_segments_by_pitch(
+                y,
+                sample_rate,
+                segments,
+                min_segment_seconds=float(os.getenv("PYANNOTE_MIN_SEGMENT_SECONDS", "0.25")),
+            )
 
             speaker_stats: dict[str, dict[str, float]] = {}
             min_segment_seconds = float(os.getenv("PYANNOTE_MIN_SEGMENT_SECONDS", "0.25"))
@@ -1105,7 +1234,7 @@ class AIProcessor:
                 key=lambda speaker: speaker_stats[speaker]["duration"],
                 reverse=True,
             )[:2]
-            chosen_speakers.sort(key=lambda speaker: speaker_stats[speaker]["first_start"])
+            chosen_speakers = self._order_duet_speakers(chosen_speakers, speaker_stats, pitch_speaker_order)
             speaker_to_index = {speaker: index for index, speaker in enumerate(chosen_speakers)}
 
             masks = [np.zeros(len(y), dtype=np.float32), np.zeros(len(y), dtype=np.float32)]
@@ -1142,6 +1271,8 @@ class AIProcessor:
 
             report = output_dir / "diarization_segments.txt"
             with report.open("w", encoding="utf-8") as file:
+                if pitch_notes:
+                    file.write("\n".join(pitch_notes) + "\n\n")
                 for segment in sorted(segments, key=lambda item: item.start):
                     mapped = speaker_to_index.get(segment.speaker)
                     if mapped is None:
@@ -1338,6 +1469,212 @@ class AIProcessor:
             raise RuntimeError(message[-1500:])
 
         return self._pick_duet_singer_outputs(list(output_dir.glob("**/*.wav")))
+
+    @staticmethod
+    def _refine_duet_segments_by_pitch(
+        y,
+        sample_rate: int,
+        segments: list[DiarizedSegment],
+        min_segment_seconds: float,
+    ) -> tuple[list[DiarizedSegment], list[str], list[str]]:
+        if not AIProcessor._env_enabled_default("DUET_PITCH_REFINE", True):
+            return segments, [], []
+
+        mode = os.getenv("DUET_PITCH_REFINE_MODE", "order").strip().lower()
+        if mode in {"0", "false", "no", "off", "none"}:
+            return segments, [], []
+
+        try:
+            import librosa
+            import numpy as np
+        except ImportError:
+            return segments, [], []
+
+        if len(segments) < 2:
+            return segments, [], []
+
+        hop_length = int(os.getenv("DUET_PITCH_HOP_LENGTH", "512"))
+        frame_length = int(os.getenv("DUET_PITCH_FRAME_LENGTH", "2048"))
+        fmin = float(os.getenv("DUET_PITCH_FMIN_HZ", "55"))
+        fmax = float(os.getenv("DUET_PITCH_FMAX_HZ", "1100"))
+        min_voiced_ratio = float(os.getenv("DUET_PITCH_MIN_VOICED_RATIO", "0.18"))
+        min_refine_seconds = float(os.getenv("DUET_PITCH_MIN_SEGMENT_SECONDS", str(max(0.4, min_segment_seconds))))
+        min_cluster_semitones = float(os.getenv("DUET_PITCH_MIN_CLUSTER_SEMITONES", "3.0"))
+
+        try:
+            f0, voiced_flag, voiced_prob = librosa.pyin(
+                y,
+                sr=sample_rate,
+                fmin=fmin,
+                fmax=fmax,
+                frame_length=frame_length,
+                hop_length=hop_length,
+            )
+        except Exception:
+            return segments, [], []
+
+        if f0 is None or len(f0) == 0:
+            return segments, [], []
+
+        f0 = np.asarray(f0, dtype=np.float32)
+        voiced_flag = np.asarray(voiced_flag, dtype=bool) if voiced_flag is not None else np.isfinite(f0)
+        voiced_prob = np.asarray(voiced_prob, dtype=np.float32) if voiced_prob is not None else np.ones_like(f0)
+        valid = np.isfinite(f0) & voiced_flag & (voiced_prob >= float(os.getenv("DUET_PITCH_MIN_PROB", "0.45")))
+
+        segment_features: list[dict[str, float | str | int]] = []
+        for index, segment in enumerate(segments):
+            duration = segment.end - segment.start
+            if duration < min_refine_seconds:
+                continue
+            start_frame = max(0, int(round(segment.start * sample_rate / hop_length)))
+            end_frame = min(len(f0), int(round(segment.end * sample_rate / hop_length)) + 1)
+            if end_frame <= start_frame:
+                continue
+            local_valid = valid[start_frame:end_frame]
+            voiced_ratio = float(np.mean(local_valid)) if local_valid.size else 0.0
+            if voiced_ratio < min_voiced_ratio:
+                continue
+            values = f0[start_frame:end_frame][local_valid]
+            if values.size < 3:
+                continue
+            median_hz = float(np.median(values))
+            if not fmin <= median_hz <= fmax:
+                continue
+            segment_features.append(
+                {
+                    "index": index,
+                    "speaker": segment.speaker,
+                    "duration": duration,
+                    "median_hz": median_hz,
+                    "voiced_ratio": voiced_ratio,
+                }
+            )
+
+        if len(segment_features) < 2:
+            return segments, [], []
+
+        log_pitch = np.array([np.log2(float(item["median_hz"])) for item in segment_features], dtype=np.float32)
+        weights = np.array(
+            [max(0.001, float(item["duration"]) * float(item["voiced_ratio"])) for item in segment_features],
+            dtype=np.float32,
+        )
+        low_center = float(np.percentile(log_pitch, 25))
+        high_center = float(np.percentile(log_pitch, 75))
+        if abs(high_center - low_center) < 1e-5:
+            return segments, [], []
+
+        labels = np.zeros(len(log_pitch), dtype=np.int16)
+        for _ in range(16):
+            distances = np.vstack([np.abs(log_pitch - low_center), np.abs(log_pitch - high_center)])
+            labels = np.argmin(distances, axis=0).astype(np.int16)
+            if len(set(labels.tolist())) < 2:
+                return segments, [], []
+            next_low = float(np.average(log_pitch[labels == 0], weights=weights[labels == 0]))
+            next_high = float(np.average(log_pitch[labels == 1], weights=weights[labels == 1]))
+            if next_low > next_high:
+                next_low, next_high = next_high, next_low
+                labels = 1 - labels
+            if abs(next_low - low_center) < 1e-5 and abs(next_high - high_center) < 1e-5:
+                break
+            low_center, high_center = next_low, next_high
+
+        separation_semitones = abs(high_center - low_center) * 12.0
+        if separation_semitones < min_cluster_semitones:
+            return segments, [
+                f"pitch_refine=skipped; clusters too close ({separation_semitones:.2f} semitones)"
+            ], []
+
+        segment_to_pitch_speaker: dict[int, str] = {}
+        original_votes: dict[str, dict[str, float]] = {}
+        original_pitch_sum: dict[str, float] = {}
+        original_pitch_weight: dict[str, float] = {}
+        low_count = 0
+        high_count = 0
+        for item, label in zip(segment_features, labels, strict=True):
+            pitch_speaker = "pitch_low" if int(label) == 0 else "pitch_high"
+            if pitch_speaker == "pitch_low":
+                low_count += 1
+            else:
+                high_count += 1
+            segment_to_pitch_speaker[int(item["index"])] = pitch_speaker
+            votes = original_votes.setdefault(str(item["speaker"]), {"pitch_low": 0.0, "pitch_high": 0.0})
+            weight = float(item["duration"]) * float(item["voiced_ratio"])
+            votes[pitch_speaker] += weight
+            speaker = str(item["speaker"])
+            original_pitch_sum[speaker] = original_pitch_sum.get(speaker, 0.0) + float(item["median_hz"]) * weight
+            original_pitch_weight[speaker] = original_pitch_weight.get(speaker, 0.0) + weight
+
+        if low_count == 0 or high_count == 0:
+            return segments, [], []
+
+        original_to_pitch: dict[str, str] = {}
+        for speaker, votes in original_votes.items():
+            original_to_pitch[speaker] = "pitch_high" if votes["pitch_high"] > votes["pitch_low"] else "pitch_low"
+
+        pitch_order = os.getenv("DUET_PITCH_PART_ORDER", "low_first").strip().lower()
+        speaker_pitch_centers = {
+            speaker: original_pitch_sum[speaker] / original_pitch_weight[speaker]
+            for speaker in original_pitch_sum
+            if original_pitch_weight.get(speaker, 0.0) > 0.0
+        }
+        ordered_speakers = sorted(speaker_pitch_centers, key=lambda speaker: speaker_pitch_centers[speaker])
+        if pitch_order in {"high_first", "high-first", "female_first", "female-first"}:
+            ordered_speakers.reverse()
+
+        notes = [
+            (
+                "pitch_refine=order; "
+                f"low~{2 ** low_center:.1f}Hz, high~{2 ** high_center:.1f}Hz, "
+                f"gap={separation_semitones:.2f} semitones"
+            ),
+            f"part_order={'high_pitch_first' if ordered_speakers and ordered_speakers[0] == max(speaker_pitch_centers, key=speaker_pitch_centers.get) else 'low_pitch_first'}",
+        ]
+        if mode not in {"segment", "segments", "relabel", "gender", "gendered", "split"}:
+            return segments, notes, ordered_speakers
+
+        refined: list[DiarizedSegment] = []
+        for index, segment in enumerate(segments):
+            pitch_speaker = segment_to_pitch_speaker.get(index) or original_to_pitch.get(segment.speaker)
+            refined.append(DiarizedSegment(segment.start, segment.end, pitch_speaker or segment.speaker))
+
+        notes = [
+            (
+                "pitch_refine=segment; "
+                f"low~{2 ** low_center:.1f}Hz, high~{2 ** high_center:.1f}Hz, "
+                f"gap={separation_semitones:.2f} semitones"
+            ),
+            f"part_order={'high_pitch_first' if pitch_order in {'high_first', 'high-first', 'female_first', 'female-first'} else 'low_pitch_first'}",
+        ]
+        return refined, notes, ["pitch_high", "pitch_low"] if pitch_order in {
+            "high_first",
+            "high-first",
+            "female_first",
+            "female-first",
+        } else ["pitch_low", "pitch_high"]
+
+    @staticmethod
+    def _order_duet_speakers(
+        speakers: list[str],
+        speaker_stats: dict[str, dict[str, float]],
+        pitch_speaker_order: list[str] | None = None,
+    ) -> list[str]:
+        if pitch_speaker_order:
+            ranked = {speaker: index for index, speaker in enumerate(pitch_speaker_order)}
+            return sorted(speakers, key=lambda speaker: (ranked.get(speaker, len(ranked)), speaker_stats[speaker]["first_start"]))
+
+        pitch_order = os.getenv("DUET_PITCH_PART_ORDER", "low_first").strip().lower()
+        if set(speakers) <= {"pitch_low", "pitch_high"}:
+            if pitch_order in {"high_first", "high-first", "female_first", "female-first"}:
+                return sorted(speakers, key=lambda speaker: 0 if speaker == "pitch_high" else 1)
+            return sorted(speakers, key=lambda speaker: 0 if speaker == "pitch_low" else 1)
+        return sorted(speakers, key=lambda speaker: speaker_stats[speaker]["first_start"])
+
+    @staticmethod
+    def _env_enabled_default(name: str, default: bool) -> bool:
+        value = os.getenv(name, "").strip().lower()
+        if not value:
+            return default
+        return value in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _smooth_frame_labels(frame_labels, window_frames: int):
@@ -1849,6 +2186,110 @@ class AIProcessor:
         if process.returncode != 0:
             raise RuntimeError(stderr.decode("utf-8", errors="ignore")[-1000:])
 
+    async def _export_active_preview(
+        self,
+        source: Path,
+        output: Path,
+        work_dir: Path,
+        index: int,
+    ) -> None:
+        active_wav = work_dir / f"duet_part_{index}_active_preview.wav"
+
+        def build_preview() -> Path:
+            try:
+                import librosa
+                import numpy as np
+                import soundfile as sf
+            except ImportError as exc:
+                raise OptionalFeatureMissing(
+                    "듀엣 미리듣기 무음 제거에 필요한 `librosa`와 `soundfile`이 설치되어 있지 않습니다. "
+                    "`scripts/install.ps1` 또는 `scripts/install.sh`를 다시 실행해 주세요."
+                ) from exc
+
+            y, sample_rate = librosa.load(source, sr=None, mono=True)
+            if y.size == 0:
+                raise RuntimeError("미리듣기 파일을 만들 보컬 stem이 비어 있습니다.")
+
+            frame_length = 2048
+            hop_length = 512
+            rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+            max_rms = float(np.max(rms)) if rms.size else 0.0
+            if max_rms <= 1e-7:
+                sf.write(active_wav, y[: min(len(y), sample_rate * 10)], sample_rate)
+                return active_wav
+
+            threshold_ratio = float(os.getenv("DUET_PREVIEW_ACTIVE_RMS_RATIO", "0.12"))
+            min_threshold = float(os.getenv("DUET_PREVIEW_MIN_RMS", "0.004"))
+            threshold = max(max_rms * threshold_ratio, min_threshold)
+            active = rms >= threshold
+            frame_indices = np.flatnonzero(active)
+            if frame_indices.size == 0:
+                threshold = max(max_rms * 0.04, 1e-6)
+                frame_indices = np.flatnonzero(rms >= threshold)
+
+            padding_seconds = float(os.getenv("DUET_PREVIEW_PADDING_SECONDS", "0.18"))
+            min_chunk_seconds = float(os.getenv("DUET_PREVIEW_MIN_CHUNK_SECONDS", "0.45"))
+            max_preview_seconds = float(os.getenv("DUET_PREVIEW_MAX_SECONDS", "45"))
+            crossfade_seconds = float(os.getenv("DUET_PREVIEW_CROSSFADE_SECONDS", "0.025"))
+            padding = int(padding_seconds * sample_rate)
+            min_chunk = int(min_chunk_seconds * sample_rate)
+            max_samples = max(1, int(max_preview_seconds * sample_rate))
+            crossfade = max(0, int(crossfade_seconds * sample_rate))
+
+            ranges: list[tuple[int, int]] = []
+            if frame_indices.size:
+                start_frame = int(frame_indices[0])
+                previous_frame = int(frame_indices[0])
+                max_gap_frames = max(1, int(round(0.35 * sample_rate / hop_length)))
+                for frame in frame_indices[1:]:
+                    frame = int(frame)
+                    if frame - previous_frame > max_gap_frames:
+                        start = max(0, start_frame * hop_length - padding)
+                        end = min(len(y), previous_frame * hop_length + frame_length + padding)
+                        if end - start >= min_chunk:
+                            ranges.append((start, end))
+                        start_frame = frame
+                    previous_frame = frame
+                start = max(0, start_frame * hop_length - padding)
+                end = min(len(y), previous_frame * hop_length + frame_length + padding)
+                if end - start >= min_chunk:
+                    ranges.append((start, end))
+
+            if not ranges:
+                sf.write(active_wav, y[: min(len(y), max_samples)], sample_rate)
+                return active_wav
+
+            pieces: list[np.ndarray] = []
+            total = 0
+            for start, end in ranges:
+                if total >= max_samples:
+                    break
+                chunk = y[start:end]
+                remaining = max_samples - total
+                if len(chunk) > remaining:
+                    chunk = chunk[:remaining]
+                pieces.append(chunk.astype(np.float32, copy=False))
+                total += len(chunk)
+
+            preview = pieces[0]
+            for chunk in pieces[1:]:
+                fade = min(crossfade, len(preview), len(chunk))
+                if fade > 1:
+                    out = np.linspace(1.0, 0.0, fade, dtype=np.float32)
+                    inn = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                    preview = np.concatenate([preview[:-fade], preview[-fade:] * out + chunk[:fade] * inn, chunk[fade:]])
+                else:
+                    preview = np.concatenate([preview, chunk])
+
+            peak = float(np.max(np.abs(preview))) if preview.size else 0.0
+            if peak > 0.98:
+                preview = preview / peak * 0.98
+            sf.write(active_wav, preview, sample_rate)
+            return active_wav
+
+        await asyncio.to_thread(build_preview)
+        await self._export_audio(active_wav, output)
+
     async def _measure_loudnorm(self, source: Path) -> dict[str, str]:
         cmd = [
             self.ffmpeg.executable(),
@@ -1939,6 +2380,57 @@ class AIProcessor:
             "320k",
             str(output),
         ]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(stderr.decode("utf-8", errors="ignore")[-1000:])
+
+    async def _merge_duet_parts(
+        self,
+        vocal_parts: list[tuple[Path, float, str]],
+        instrumental: Path,
+        output: Path,
+    ) -> None:
+        if not vocal_parts:
+            raise ValueError("합성할 듀엣 보컬 파트가 없습니다.")
+
+        filters: list[str] = []
+        vocal_labels: list[str] = []
+        for index, (_, volume, _) in enumerate(vocal_parts):
+            safe_volume = min(2.5, max(0.0, float(volume)))
+            label = f"v{index}"
+            filters.append(f"[{index}:a]volume={safe_volume:.4f}[{label}]")
+            vocal_labels.append(f"[{label}]")
+
+        instrumental_index = len(vocal_parts)
+        filters.append(f"[{instrumental_index}:a]volume=0.74[i]")
+        if len(vocal_labels) == 1:
+            filters.append(f"{vocal_labels[0]}volume=1.02[dv]")
+        else:
+            filters.append(
+                f"{''.join(vocal_labels)}amix=inputs={len(vocal_labels)}:duration=longest:normalize=0[dv]"
+            )
+        filters.append("[dv][i]amix=inputs=2:duration=longest:normalize=0[m]")
+        filters.append("[m]loudnorm=I=-14:TP=-1.5:LRA=11,alimiter=limit=0.98")
+
+        cmd = [self.ffmpeg.executable(), "-y"]
+        for part, _, _ in vocal_parts:
+            cmd.extend(["-i", str(part)])
+        cmd.extend(
+            [
+                "-i",
+                str(instrumental),
+                "-filter_complex",
+                ";".join(filters),
+                "-b:a",
+                "320k",
+                str(output),
+            ]
+        )
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,

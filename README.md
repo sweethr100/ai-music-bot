@@ -136,7 +136,7 @@ AI_COVER_INPUT_VOCAL_FILTER=none
 AI_COVER_OUTPUT_VOCAL_FILTER=none
 ```
 
-AI 듀엣은 `/play_duet`에서 `voice1`과 `voice2`를 고르면 실행됩니다. 두 옵션은 모두 필수이며, 원곡 가수를 그대로 둘 파트는 `원본 가수`를 선택합니다. 기본 듀엣 분리는 PyAnnote Audio로 “몇 분 몇 초에 누가 부르는지” 시간표를 만든 뒤, 그 구간만 잘라서 1번/2번 파트로 보냅니다.
+AI 듀엣은 `/play_duet`에서 곡만 넣으면 먼저 PyAnnote Audio로 “몇 분 몇 초에 누가 부르는지” 시간표를 만들고, 분리된 1번/2번 보컬 stem 미리듣기 파일을 채팅에 올립니다. 미리 들어본 뒤 설정 패널에서 각 파트의 목소리, 피치, 볼륨을 고르고 `듀엣 렌더`를 누르면 최종 파일을 만듭니다.
 
 PyAnnote Audio는 기본 설치에 포함됩니다.
 
@@ -203,7 +203,16 @@ PyAnnote 없이 로컬 방식만 쓰고 싶으면:
 MULTI_SINGER_SEPARATOR_BACKEND=local_diarization
 ```
 
-이 방식들은 실제 source separation이 아니라 diarization 기반 시간 절단 방식입니다. 두 사람이 동시에 부르는 화음/후렴은 완전 분리하지 못하고, 파트가 번갈아 나오는 듀엣에서 가장 잘 맞습니다.
+이 방식들은 실제 source separation이 아니라 diarization 기반 시간 절단 방식입니다. 두 사람이 동시에 부르는 화음/후렴은 완전 분리하지 못하고, 파트가 번갈아 나오는 듀엣에서 가장 잘 맞습니다. 기본값은 PyAnnote가 구분한 가수 구간을 유지하고, 피치는 `1번/2번` 파트 순서를 정렬하는 데만 사용합니다.
+
+```env
+DUET_PITCH_REFINE=true
+DUET_PITCH_REFINE_MODE=order
+DUET_PITCH_PART_ORDER=low_first
+DUET_PITCH_MIN_CLUSTER_SEMITONES=3.0
+```
+
+특정 곡에서 파트 순서를 반대로 쓰고 싶으면 `DUET_PITCH_PART_ORDER=high_first`로 바꿉니다. 남녀 듀엣처럼 음역 차이가 아주 크고 PyAnnote가 남녀를 섞어 잡는 곡에서는 `DUET_PITCH_REFINE_MODE=segment`를 켜면 구간 자체를 낮은 음역/높은 음역 기준으로 다시 나눕니다.
 
 다른 multi-singer 모델을 실험하고 싶을 때만 아래 값을 `.env`에 넣습니다.
 
@@ -229,7 +238,7 @@ PyAnnote가 실패하면 듀엣 처리는 중단됩니다. 곡마다 두 가수 
 
 녹음 파일은 48kHz stereo PCM WAV로 저장되고, 한 파일이 약 5분 분량에 도달하면 자동으로 다음 파일로 분할됩니다. 봇이나 음성 수신이 일시적으로 끊겨도 WAV 헤더를 주기적으로 갱신해 손상 가능성을 줄입니다.
 
-녹음을 끝낼 때는 `/record_stop`을 실행합니다. 이후 `/train_voice dataset:<유저 데이터셋> model_name:<목소리이름>`을 실행하면 Applio RVC 학습 파이프라인이 돌아가고, 결과가 `voice_models/<목소리이름>/`에 저장됩니다. 학습이 끝난 모델은 `/play`의 `target_voice`와 `/play_duet`의 `voice1`, `voice2` 자동완성에 바로 표시됩니다.
+녹음을 끝낼 때는 `/record_stop`을 실행합니다. 이후 `/train_voice dataset:<유저 데이터셋> model_name:<목소리이름>`을 실행하면 Applio RVC 학습 파이프라인이 돌아가고, 결과가 `voice_models/<목소리이름>/`에 저장됩니다. 학습이 끝난 모델은 `/play`의 `target_voice`와 `/play_duet` 설정 패널의 목소리 선택에 바로 표시됩니다.
 
 학습 기본값:
 
@@ -276,8 +285,7 @@ python bot.py
 /play query:https://youtu.be/... target_voice:myvoice vocal_pitch_shift:+6
 /play_file file:<업로드 파일> mode:원본 재생
 /play_file file:<업로드 파일> target_voice:myvoice vocal_pitch_shift:+6
-/play_duet query:artist duet song voice1:원본 가수 voice2:voice2
-/play_duet query:artist duet song voice1:voice1 voice2:voice2
+/play_duet query:artist duet song
 /separate_singers query:artist duet song
 /record_start
 /record_status
